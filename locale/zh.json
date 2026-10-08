@@ -1,0 +1,4 @@
+{
+  "title": "Token Frugal",
+  "description": "在 tools/post-execute 处对工具输出做源头压缩，并可在 agent/created 处精简每个 agent 的工具目录，让长会话用更少的输入上下文完成同样的任务。随附测量脚本，可回放已记录会话并报告 token 与缓存命中率的变化。"
+}

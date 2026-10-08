@@ -1,0 +1,88 @@
+# Bundle patch for dsh-token-frugal.
+#
+# This row mounts the Host plugin. Every tunable lives here, in `config`, so the
+# effective policy is readable in one place and survives plugin upgrades: this
+# patch is a profile layer, not part of the plugin's code.
+#
+# The defaults below were chosen by replaying recorded sessions with
+# `node tools/measure-tokens.mjs --replay`; see README.md for the measured
+# before/after numbers on this machine.
+- insert:
+    - id: token-frugal
+      name: dsh-token-frugal
+      config:
+        enabled: true
+
+        # Post-execute compression -------------------------------------------
+        # Character budget applied to any tool without its own entry below.
+        defaultMaxChars: 1500
+        # Per-tool budgets. `read` keeps the most generous share because file
+        # content is the substrate for later edits; terminal/search output is
+        # mostly formatting, so it gets less. These are the values measured to
+        # clear the 40% target with margin; README.md lists looser and tighter
+        # profiles side by side.
+        toolBudgets:
+          read: 3000
+          web_fetch: 4000
+          web_search: 3000
+          pwsh: 1200
+          bash: 1200
+          grep: 1500
+          glob: 1500
+          cordis_inspect_query: 2000
+          cordis_inspect_list: 2000
+          plugin_manager: 2000
+        # Failed calls keep twice their budget: an error message is worth more
+        # than a success message of the same size.
+        errorBudgetFactor: 2
+        # Never touched, whatever their size.
+        skipTools: []
+        # Blocks smaller than this are passed through byte-for-byte.
+        minBlockChars: 320
+        # A rewrite must save at least this fraction or it is discarded, so
+        # trivia never churns the request prefix.
+        minGainRatio: 0.02
+        # Lossless transforms. Set `columns: false` if a workflow depends on
+        # reading alignment-padded tables from tool output.
+        transforms:
+          terminal: true
+          blankSpace: true
+          columns: true
+          repeatedLines: true
+          numericRuns: true
+          json: true
+        columnMinSpaces: 3
+        repeatedMinRun: 3
+        numericMinRun: 6
+
+        # Head/tail elision --------------------------------------------------
+        headRatio: 0.45
+        tailRatio: 0.35
+        # Keep middle lines that mention errors/warnings rather than blind
+        # slicing.
+        structureAware: true
+        # `spill` stores the full text through ctx.spillStore and names the
+        # locator in the elision marker; if no backend is mounted, elision is
+        # skipped and only the lossless transforms apply. `none` disables
+        # elision outright.
+        recovery: spill
+        # A `read` result is reproducible from its <path>, so it is recovered by
+        # re-reading with offset/limit instead of by a spill artifact.
+        readSourceRecovery: true
+
+        # Diagnostics --------------------------------------------------------
+        logStatsEvery: 25
+
+        # Tool-catalogue visibility (agent/created) ---------------------------
+        # Tools hidden from every agent through ctx.tools.restrict(). Empty
+        # means the catalogue is left exactly as composed. Names must be real
+        # global tools; unknown names are reported and ignored. Hiding a tool
+        # changes the request envelope, so the first step after the change
+        # records it as a `tool-removal` block and re-uses cache from there on.
+        hiddenTools: []
+        # Example: a deployment that never delegates in the background can drop
+        # the delegation schemas from every request:
+        # hiddenTools:
+        #   - subagent
+        #   - subagent_fork
+        #   - workflow

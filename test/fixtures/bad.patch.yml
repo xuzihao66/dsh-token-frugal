@@ -1,0 +1,6 @@
+- insert:
+    - id: token-frugal
+      name: dsh-token-frugal
+      config:
+        enabled: true
+        notARealSetting: 1

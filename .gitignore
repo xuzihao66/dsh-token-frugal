@@ -1,0 +1,19 @@
+# Dependencies: this plugin ships none, but a checkout may gain them.
+node_modules/
+pnpm-lock.yaml
+package-lock.json
+
+# Build artifacts and packed releases.
+dist/
+*.tgz
+
+# Measurement output.
+report.json
+report-*.json
+
+# Editor and OS noise.
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log

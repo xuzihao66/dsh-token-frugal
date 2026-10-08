@@ -1,0 +1,14 @@
+# The Harness loads these files as ES modules, so the repository keeps LF and
+# the packed tarball stays byte-identical on every platform.
+* text=auto eol=lf
+
+# Packed releases and binary assets.
+*.tgz binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.woff2 binary
+
+# Generated reports stay out of diffs.
+report*.json linguist-generated=true

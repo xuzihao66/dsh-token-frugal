@@ -1,0 +1,70 @@
+{
+  "name": "dsh-token-frugal",
+  "version": "1.0.0",
+  "description": "Cut the input-token cost of long Harness sessions: structure-aware tool-output compression on tools/post-execute and per-agent tool-catalogue visibility on agent/created.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./tools/measure-tokens.mjs": "./tools/measure-tokens.mjs"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "tools",
+    "test",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "locale"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "xuzihao66",
+    "url": "https://github.com/xuzihao66"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xuzihao66/dsh-token-frugal.git"
+  },
+  "homepage": "https://github.com/xuzihao66/dsh-token-frugal#readme",
+  "bugs": {
+    "url": "https://github.com/xuzihao66/dsh-token-frugal/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "meta": {
+    "title": "Token Frugal",
+    "description": "Compresses tool output at the source and trims the tool catalogue, with a measurement script that reports the token and cache-hit-rate effect."
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.2.0-rc.2"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "check": "node --check index.js && node --check lib/compress.js && node --check lib/estimate.js && node --check lib/defaults.js && node --check tools/measure-tokens.mjs && node --check test/load-check.mjs",
+    "test": "node --test test/*.test.mjs",
+    "load-check": "node test/load-check.mjs",
+    "measure": "node tools/measure-tokens.mjs",
+    "verify": "npm run check && npm test && npm run load-check"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "tokens",
+    "context",
+    "compression"
+  ]
+}
