@@ -1,3 +1,53 @@
+dsh-your-plugin
+
+一个用于减少 DSH 调用 token 浪费的插件。
+
+功能
+
+· 在工具输出写入对话前进行头尾裁剪，中间用元数据替换
+· 对 JSON/CSV 等结构化输出做压缩，降低上下文占用
+· 管理工具 schema 可见性，避免不用的工具描述进入请求
+· 附带测量脚本，报告优化前后的 token 对比
+
+安装
+
+```bash
+dsh plugin --profile web add dsh-your-plugin
+```
+
+配置
+
+在 cordis.patch.yml 中调整参数：
+
+```yaml
+config:
+  thresholdRatio: 0.3
+  keepHeadRatio: 0.4
+  keepTailRatio: 0.4
+  exemptTools: []
+```
+
+开发
+
+```bash
+git clone https://github.com/<你的账号>/dsh-your-plugin.git
+cd dsh-your-plugin
+npm install
+```
+
+插件导出 { name, inject, apply }，所有改写走 DSH 事件流，保持 model-visible 与 logged 一致。
+
+验证
+
+```bash
+node measure-token-savings.mjs
+```
+
+输出优化前后的 token 数对比与缓存命中率变化。
+
+（后续会创建自选优化项目的窗口，以供个人自己调配）
+（这次忘记添加在工作文件夹后自动创建md脚本，以防止反复调去上下文消耗大量token）
+
 # dsh-token-frugal
 
 Cut the input-token cost of a long DeepSeek Harness session without taking any
