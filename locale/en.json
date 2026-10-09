@@ -1,4 +1,4 @@
 {
   "title": "Token Frugal",
-  "description": "Compresses tool output at the source on tools/post-execute and can trim the per-agent tool catalogue on agent/created, so a long session carries less input context for the same work. Ships a measurement script that replays recorded sessions and reports the token and cache-hit-rate change."
+  "description": "Compresses tool output at the source, trims the per-agent tool catalogue, and keeps a per-workspace session memory that recall matches before the transcript is re-read. Every saving has a switch in a panel under the composer; a measurement script replays recorded sessions and reports the token and cache-hit-rate change."
 }

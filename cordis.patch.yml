@@ -86,3 +86,43 @@
         #   - subagent
         #   - subagent_fork
         #   - workflow
+
+        # Saving modes (the panel under the composer) ------------------------
+        # `modes` pins a mode from the patch. Anything omitted starts from the
+        # value its v1 key implies, and the panel then owns it at runtime: the
+        # plugin writes the panel's choice to a small state file next to this
+        # profile and never rewrites this file. Mode ids:
+        #   terminal columns repeatedLines numericRuns json   (all lossless)
+        #   elide      head/tail trimming, always with a recovery path
+        #   catalogue  apply hiddenTools
+        #   memo       record the memory document
+        #   recall     match the memory document and inject the hits
+        modes: {}
+
+        # Session memory document (v2) ---------------------------------------
+        # One markdown file per workspace, one `## session` section per
+        # conversation: your messages verbatim plus a turn digest drawn from the
+        # replies. Recording costs no model tokens. The path is relative to the
+        # session's workspace, so the record travels with the work; add it to
+        # .gitignore when the workspace is a repository.
+        memo:
+          enabled: true
+          path: .dsh-token-frugal/memory.md
+          maxEntryChars: 2000
+
+        # Recall (v2) --------------------------------------------------------
+        # A new user message is matched against the document above and the best
+        # blocks are injected as an `agent/inbox/spliced` event, which appends
+        # to the request instead of rewriting it, so the provider's prefix cache
+        # survives. `minMatchedTerms` is what stops one shared word from
+        # spending tokens on an irrelevant extract.
+        recall:
+          enabled: true
+          maxChars: 1200
+          maxBlocks: 4
+          minScore: 0.8
+          minMatchedTerms: 2
+
+        # The route the composer panel uses to read and change the modes.
+        bridge:
+          path: /dsh-token-frugal/modes

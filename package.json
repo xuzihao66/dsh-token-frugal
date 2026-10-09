@@ -1,22 +1,25 @@
 {
   "name": "dsh-token-frugal",
-  "version": "1.0.0",
-  "description": "Cut the input-token cost of long Harness sessions: structure-aware tool-output compression on tools/post-execute and per-agent tool-catalogue visibility on agent/created.",
+  "version": "2.0.0",
+  "description": "Cut the input-token cost of long Harness sessions: structure-aware tool-output compression, per-agent tool-catalogue visibility, a composer panel that turns each saving on or off, and a per-workspace session memory that is matched before the transcript is re-read.",
   "type": "module",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json",
     "./tools/measure-tokens.mjs": "./tools/measure-tokens.mjs"
   },
   "files": [
     "index.js",
+    "client.js",
     "lib",
     "tools",
     "test",
     "cordis.patch.yml",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
     "locale"
   ],
@@ -41,7 +44,7 @@
   },
   "meta": {
     "title": "Token Frugal",
-    "description": "Compresses tool output at the source and trims the tool catalogue, with a measurement script that reports the token and cache-hit-rate effect."
+    "description": "Compresses tool output at the source, trims the tool catalogue, and keeps a per-workspace session memory that recall matches before the transcript is re-read. Every saving has a switch under the composer; a measurement script reports the token and cache-hit-rate effect."
   },
   "dsh": {
     "engines": {
@@ -49,10 +52,17 @@
     },
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
     }
   },
   "scripts": {
-    "check": "node --check index.js && node --check lib/compress.js && node --check lib/estimate.js && node --check lib/defaults.js && node --check tools/measure-tokens.mjs && node --check test/load-check.mjs",
+    "check": "node --check index.js && node --check client.js && node --check lib/compress.js && node --check lib/estimate.js && node --check lib/defaults.js && node --check lib/modes.js && node --check lib/memo.js && node --check lib/recall.js && node --check tools/measure-tokens.mjs && node --check test/load-check.mjs",
     "test": "node --test test/*.test.mjs",
     "load-check": "node test/load-check.mjs",
     "measure": "node tools/measure-tokens.mjs",
@@ -65,6 +75,7 @@
     "cordis",
     "tokens",
     "context",
-    "compression"
+    "compression",
+    "memory"
   ]
 }

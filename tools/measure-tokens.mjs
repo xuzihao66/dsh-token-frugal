@@ -160,6 +160,19 @@ function readPatchConfig(path) {
       const inner = value.slice(1, -1).trim();
       return inner === '' ? [] : inner.split(',').map((part) => scalar(part));
     }
+    // An inline map (`modes: {}`, `transforms: { json: false }`), which is how a
+    // one-line override is most naturally written.
+    if (/^\{.*\}$/.test(value)) {
+      const inner = value.slice(1, -1).trim();
+      if (inner === '') return {};
+      const out = {};
+      for (const pair of inner.split(',')) {
+        const at = pair.indexOf(':');
+        if (at === -1) continue;
+        out[pair.slice(0, at).trim().replace(/^['"]|['"]$/g, '')] = scalar(pair.slice(at + 1));
+      }
+      return out;
+    }
     return value.replace(/^['"]|['"]$/g, '');
   };
   for (const line of text.split('\n')) {

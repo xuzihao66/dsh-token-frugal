@@ -1,272 +1,311 @@
 #!/usr/bin/env node
 /**
- * Load check: prove the plugin mounts the way the Harness mounts it.
+ * Integration check: prove both halves mount the way the Harness mounts them.
  *
- * This is the strongest verification available without installing the bundle
- * into a live profile. It imports the real `index.js` with a real
- * `@deepseek-ai/schemastery` build, validates the shipped `cordis.patch.yml`
- * against the exported `Config`, and drives `apply()` through a fake Cordis
- * context so the two extension points behave as the Harness would drive them.
- *
- * Inside a profile, `@deepseek-ai/schemastery` resolves from the dsh
- * installation and no arguments are needed:
+ * The Host half imports nothing outside its own files and Node builtins, so
+ * this runs with no arguments, no extraction step, and no dependency on the
+ * installed Harness:
  *
  *   node test/load-check.mjs
  *
- * Outside one, point it at any directory that holds the vendored core
- * packages, and it builds a throwaway sandbox in the temp directory:
+ * It covers:
  *
- *   node test/load-check.mjs --core-dir <dir containing @deepseek-ai/schemastery>
+ *   - the exported surface and the shipped patch against `resolveConfig`
+ *   - `tools/post-execute`: lossless-only without a recovery path, `read`
+ *     elision with its own path, pass-through of decisions the plugin does not
+ *     own, and fault isolation
+ *   - `agent/created` + `agent/inbox/claimed` + `session/event`: the memory
+ *     document is created, filled with verbatim input and a turn digest, and
+ *     matched on the next message, which injects through `agent.inject`
+ *   - the mode route: GET reports the modes, POST changes and persists one
+ *   - the Client half: its module id, its `slots` dependency, and the exact
+ *     slot registration the page will consume
  *
  * Exit status is 0 when every check passes.
  */
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { tmpdir } from 'node:os';
-import zlib from 'node:zlib';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const PLUGIN_ROOT = resolve(HERE, '..');
-/** Core packages the plugin's `Config` needs at import time. */
-const CORE_PACKAGES = ['@deepseek-ai/schemastery', '@deepseek-ai/cosmokit'];
+const ROOT = resolve(HERE, '..');
+const load = (relative) => import(pathToFileURL(join(ROOT, relative)).href);
 
-function parseArgs(list) {
-  const options = {};
-  for (let i = 0; i < list.length; i++) {
-    if (list[i] === '--core-dir') options.coreDir = list[++i];
-    else if (list[i] === '--from-asar') options.fromAsar = list[++i];
-    else if (list[i] === '--plugin') options.plugin = list[++i];
-    else throw new Error(`unknown argument ${list[i]}`);
-  }
-  return options;
+const plugin = await load('index.js');
+const { readPatchConfig } = await load('tools/measure-tokens.mjs');
+const { MODE_IDS } = await load('lib/modes.js');
+
+// ---------------------------------------------------------------------------
+// exports and config
+// ---------------------------------------------------------------------------
+assert.equal(plugin.name, 'token-frugal');
+assert.deepEqual(plugin.inject, ['tools']);
+assert.equal(typeof plugin.apply, 'function');
+assert.equal(typeof plugin.resolveConfig, 'function');
+console.log(`exports ok: name=${plugin.name} inject=${JSON.stringify(plugin.inject)}`);
+
+const workspace = mkdtempSync(join(tmpdir(), 'tf-load-'));
+process.env.DSH_PROFILE_DIR = workspace;
+const rowConfig = readPatchConfig(join(ROOT, 'cordis.patch.yml'));
+assert.ok(rowConfig !== undefined, 'cordis.patch.yml must yield a config block');
+const resolved = plugin.resolveConfig(rowConfig);
+assert.equal(resolved.defaultMaxChars, 1500);
+assert.equal(resolved.budgets.get('read'), 3000);
+assert.equal(resolved.memo.path, '.dsh-token-frugal/memory.md');
+assert.equal(resolved.recall.maxChars, 1200);
+assert.equal(resolved.bridge.path, '/dsh-token-frugal/modes');
+console.log(`config validated from the patch: ${Object.keys(plugin.FIELD_KINDS).length} validated fields, memo=${resolved.memo.path}`);
+
+for (const [label, config] of [
+  ['unknown field', { notARealSetting: 1 }],
+  ['unknown mode', { modes: { teleport: true } }],
+  ['unknown memo key', { memo: { nope: 1 } }],
+  ['unknown recall key', { recall: { nope: 1 } }],
+  ['unknown bridge key', { bridge: { nope: 1 } }],
+  ['wrong mode type', { modes: { json: 'yes' } }],
+  ['wrong recall type', { recall: { maxChars: -5 } }],
+]) {
+  let message;
+  try { plugin.resolveConfig({ ...rowConfig, ...config }); } catch (error) { message = error.message; }
+  assert.ok(message !== undefined, `${label} must be refused`);
+  assert.match(message, /token-frugal:/);
 }
+console.log('undeclared fields, modes, and wrong types are all refused');
 
-/** Locate the installed Harness bundle so the core packages can be read out of it. */
-function findAppAsar() {
-  if (process.env.DSH_APP_ASAR !== undefined) return process.env.DSH_APP_ASAR;
-  const candidates = [
-    process.env.LOCALAPPDATA === undefined ? undefined : join(process.env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness', 'resources', 'app.asar'),
-    '/Applications/DeepSeek Harness.app/Contents/Resources/app.asar',
-    process.env.HOME === undefined ? undefined : join(process.env.HOME, 'Applications', 'DeepSeek Harness.app', 'Contents', 'Resources', 'app.asar'),
-  ];
-  for (const candidate of candidates) {
-    if (candidate !== undefined && existsSync(candidate)) return candidate;
-  }
-  return undefined;
-}
+// ---------------------------------------------------------------------------
+// a fake Cordis context, agent, and HTTP exchange
+// ---------------------------------------------------------------------------
+const listeners = new Map();
+const routes = new Map();
+const warnings = [];
+const infos = [];
+const injected = [];
 
-/**
- * Extract the core packages this check needs out of an Electron `app.asar`.
- * The archive is an 8-byte pickle header followed by a JSON directory; file
- * bodies follow, aligned to the header. Only the two packages above are read.
- * @param asarPath - the bundle to read.
- * @param destination - directory that will hold `<@scope>/<name>` subdirectories.
- */
-function extractCoreFromAsar(asarPath, destination) {
-  const buffer = readFileSync(asarPath);
-  const headerSize = buffer.readUInt32LE(4);
-  const jsonSize = buffer.readUInt32LE(8);
-  const raw = buffer.toString('utf8', 16, 16 + jsonSize);
-  // The header string is padded to a 4-byte boundary.
-  const header = JSON.parse(raw.slice(0, raw.lastIndexOf('}') + 1));
-  const baseOffset = 8 + headerSize;
-  const wanted = new Set(CORE_PACKAGES.map((name) => `dsh/node_modules/${name}`));
-  let extracted = 0;
-  const walk = (node, prefix) => {
-    for (const [name, child] of Object.entries(node.files ?? {})) {
-      const path = prefix === '' ? name : `${prefix}/${name}`;
-      // Descend through any ancestor of a wanted package, and take its members.
-      const relevant = [...wanted].some((root) => root === path || root.startsWith(`${path}/`) || path.startsWith(`${root}/`));
-      if (!relevant) continue;
-      if (child.files !== undefined) { walk(child, path); continue; }
-      const start = baseOffset + Number(child.offset);
-      const out = join(destination, path.slice('dsh/node_modules/'.length));
-      mkdirSync(dirname(out), { recursive: true });
-      writeFileSync(out, buffer.subarray(start, start + (child.size ?? 0)));
-      extracted += 1;
-    }
+const fire = (event, ...args) => {
+  const handlers = listeners.get(event) ?? [];
+  assert.ok(handlers.length > 0, `no listener registered for ${event}`);
+  for (const handler of handlers) handler(...args);
+};
+
+const sessionId = 'session-load-1';
+const agent = {
+  id: sessionId,
+  session: { header: { id: sessionId, cwd: workspace } },
+  inject: (message) => { injected.push(message); },
+  ctx: { tools: { restrict: () => () => {} }, effect: (fn) => { fn(); return () => {}; } },
+};
+
+const ctx = {
+  on: (event, handler) => {
+    listeners.set(event, [...(listeners.get(event) ?? []), handler]);
+    return () => {};
+  },
+  effect: (fn) => { const disposer = fn(); return typeof disposer === 'function' ? disposer : () => {}; },
+  get: (name) => (name === 'webServer'
+    ? { register: (route) => { routes.set(route.path, route); return () => routes.delete(route.path); } }
+    : undefined),
+  logger: {
+    warn: (line) => warnings.push(line),
+    info: (line) => infos.push(line),
+    debug: () => {},
+  },
+  tools: { schemas: () => [], restrict: () => () => {} },
+};
+
+plugin.apply(ctx, rowConfig);
+assert.ok(infos.some((line) => line.includes('token-frugal: ready')), 'the startup line is missing');
+assert.ok(listeners.has('tools/post-execute'));
+assert.ok(listeners.has('agent/created'));
+assert.ok(listeners.has('agent/inbox/claimed'));
+assert.ok(listeners.has('session/event'));
+console.log('apply() registered post-execute, agent/created, inbox/claimed, session/event, and the route');
+
+// ---------------------------------------------------------------------------
+// tools/post-execute
+// ---------------------------------------------------------------------------
+const next = async () => ({ kind: 'accept' });
+const contentOf = (decision, original) => (decision.content ?? original.content)[0].text;
+const exec = { name: 'pwsh', callId: 'call_1', arguments: {}, signal: undefined, agent: undefined };
+
+const oversized = Array.from({ length: 400 }, (_, i) => `row ${i} ${String(i * 7919).padStart(7)}    ${'q'.repeat(18)}      x${(i * i) % 977}   `).join('\n');
+const result = { isError: false, value: null, content: [{ type: 'text', text: oversized }] };
+const lossless = await listeners.get('tools/post-execute')[0](exec, result, next);
+const losslessText = contentOf(lossless, result);
+assert.ok(losslessText.length < oversized.length, 'lossless compression must shrink the result');
+assert.ok(losslessText.length > 1500, `the fixture must stay over budget, got ${losslessText.length}`);
+assert.ok(!losslessText.includes('elided by dsh-token-frugal'), 'no recovery path means no elision');
+console.log(`lossless only, no recovery path: ${oversized.length} -> ${losslessText.length} chars, nothing dropped`);
+
+const readText = `<path>C:\\x\\big.ts</path>\n<type>file</type>\n<content>\n${Array.from({ length: 400 }, (_, i) => `${i + 1}: const v${i} = g(${i * 31}); // ${'n'.repeat(24)}`).join('\n')}\n</content>`;
+const readDecision = await listeners.get('tools/post-execute')[0](
+  { ...exec, name: 'read' },
+  { isError: false, value: null, content: [{ type: 'text', text: readText }] },
+  next,
+);
+const readAfter = contentOf(readDecision, { content: [{ type: 'text', text: readText }] });
+assert.ok(readAfter.includes('elided by dsh-token-frugal') && readAfter.includes('offset/limit'));
+console.log(`read elided to ${readAfter.length} chars with a re-read hint`);
+
+const blocked = { kind: 'block', feedback: [{ type: 'text', text: 'no' }] };
+assert.equal(await listeners.get('tools/post-execute')[0](exec, result, async () => blocked), blocked);
+assert.equal((await listeners.get('tools/post-execute')[0](exec, result, async () => ({ kind: 'accept', value: { ok: true } }))).value.ok, true);
+const hostile = { isError: false, value: null, content: [{ type: 'text', get text() { throw new Error('boom'); } }] };
+assert.equal((await listeners.get('tools/post-execute')[0](exec, hostile, next)).kind, 'accept');
+assert.ok(warnings.some((line) => line.includes('compression skipped')));
+console.log('block and value decisions pass through; a fault degrades to the original decision');
+
+// ---------------------------------------------------------------------------
+// the memory document and recall
+// ---------------------------------------------------------------------------
+const memoPath = join(workspace, resolved.memo.path);
+fire('agent/created', { agent });
+assert.ok(existsSync(memoPath), `the memory document must exist at ${memoPath}`);
+const created = readFileSync(memoPath, 'utf8');
+assert.match(created, /# dsh-token-frugal session memory/);
+assert.match(created, new RegExp(`## ${sessionId} `));
+console.log(`memory document created: ${memoPath}`);
+
+const userLine = '请记住：重试策略实现在 dispatcher 里，超时参数在 timeoutPolicy。';
+fire('agent/inbox/claimed', { agent, message: { content: [{ type: 'text', text: userLine }] }, turn: 1 });
+assert.ok(readFileSync(memoPath, 'utf8').includes(userLine), 'the user text is recorded verbatim');
+assert.equal(injected.length, 0, 'nothing to recall yet');
+console.log('user input recorded verbatim; no recall on an empty document');
+
+fire('session/event', { id: sessionId, header: { cwd: workspace } }, {
+  type: 'assistant/message',
+  data: { message: { content: [{ type: 'text', text: '- 已完成重试策略迁移\n- 已用 29 个测试验证' }] } },
+});
+fire('session/event', { id: sessionId, header: { cwd: workspace } }, { type: 'turn/end', data: { turn: 1 } });
+const withDigest = readFileSync(memoPath, 'utf8');
+assert.ok(withDigest.includes('### summary turn 1'), 'the turn digest block is recorded');
+assert.ok(withDigest.includes('已完成重试策略迁移'), 'the digest quotes the reply, not the prompt');
+console.log('turn digest recorded from the assistant reply');
+
+fire('agent/inbox/claimed', {
+  agent,
+  message: { content: [{ type: 'text', text: '重试策略在哪个文件里实现？超时参数怎么配？' }] },
+  turn: 2,
+});
+assert.equal(injected.length, 1, `expected exactly one recall injection, got ${injected.length}`);
+assert.equal(injected[0].role, 'user');
+assert.equal(typeof injected[0].id, 'string');
+const recalled = injected[0].content[0].text;
+assert.match(recalled, /<recalled-context source=/);
+assert.match(recalled, /Prefer these over re-reading the transcript/);
+assert.match(recalled, /重试策略/);
+console.log(`recall injected ${recalled.length} chars for a matching follow-up`);
+
+fire('agent/inbox/claimed', {
+  agent,
+  message: { content: [{ type: 'text', text: '重试策略在哪个文件里实现？超时参数怎么配？' }] },
+  turn: 3,
+});
+assert.equal(injected.length, 1, 'the same extracts are never injected twice in a row');
+console.log('a repeated match is suppressed rather than re-injected');
+
+// ---------------------------------------------------------------------------
+// the mode route
+// ---------------------------------------------------------------------------
+const route = routes.get(resolved.bridge.path);
+assert.ok(route !== undefined, 'the mode route must be registered');
+assert.equal(route.kind, 'exact');
+
+const exchange = () => {
+  const state = { status: 0, headers: null, body: '' };
+  return {
+    state,
+    writeHead(status, headers) { state.status = status; state.headers = headers; },
+    end(payload) { state.body = payload ?? ''; },
+    get json() { return JSON.parse(state.body); },
   };
-  walk(header, '');
-  assert.ok(extracted > 0, `no core packages found inside ${asarPath}`);
-  return extracted;
-}
+};
 
-/**
- * Prepare a sandbox holding the plugin plus a resolvable copy of the core
- * packages, then import the plugin from there.
- * @returns the plugin module namespace and the sandbox root.
- */
-async function loadPlugin(pluginRoot, options) {
-  if (options.coreDir === undefined && options.fromAsar === undefined) {
-    // Inside a Harness process the bare specifier resolves; plain node cannot
-    // see into app.asar, so fall back to reading the bundle directly.
-    try {
-      return { module: await import(pathToFileURL(join(pluginRoot, 'index.js')).href), root: pluginRoot, sandbox: undefined };
-    } catch (error) {
-      if (!/Cannot find package|Cannot find module/.test(String(error.message))) throw error;
-    }
-  }
-  const sandbox = mkdtempSync(join(tmpdir(), 'token-frugal-loadcheck-'));
-  const target = join(sandbox, 'plugin');
-  mkdirSync(join(sandbox, 'node_modules', '@deepseek-ai'), { recursive: true });
-  if (options.coreDir !== undefined) {
-    for (const name of CORE_PACKAGES) {
-      const source = join(resolve(options.coreDir), name.split('/')[1]);
-      assert.ok(existsSync(source), `--core-dir must contain ${name} (looked in ${source})`);
-      cpSync(source, join(sandbox, 'node_modules', name), { recursive: true });
-    }
-  } else {
-    const asarPath = options.fromAsar ?? findAppAsar();
-    assert.ok(
-      asarPath !== undefined,
-      'could not find app.asar; pass --from-asar <path>, --core-dir <dir>, or set DSH_APP_ASAR',
-    );
-    const count = extractCoreFromAsar(asarPath, join(sandbox, 'node_modules'));
-    console.log(`extracted ${count} core file(s) from ${asarPath}`);
-  }
-  cpSync(pluginRoot, target, {
-    recursive: true,
-    filter: (path) => !path.split(/[\\/]/).includes('node_modules'),
-  });
-  return { module: await import(pathToFileURL(join(target, 'index.js')).href), root: target, sandbox };
-}
+const getResponse = exchange();
+await route.handler({ method: 'GET' }, getResponse);
+assert.equal(getResponse.state.status, 200);
+assert.equal(getResponse.state.headers['cache-control'], 'no-store');
+assert.equal(getResponse.json.modes.length, MODE_IDS.length);
+assert.ok(getResponse.json.modes.every((mode) => typeof mode.on === 'boolean' && typeof mode.available === 'boolean'));
+assert.equal(getResponse.json.version, 2);
+console.log(`GET ${resolved.bridge.path} -> ${MODE_IDS.length} modes`);
 
-const options = parseArgs(process.argv.slice(2));
-const pluginRoot = options.plugin === undefined ? PLUGIN_ROOT : resolve(options.plugin);
-let sandbox;
-let sandboxNeedsCleanup = false;
+const postResponse = exchange();
+await route.handler({
+  method: 'POST',
+  async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ modes: { json: false, terminal: false } })); },
+}, postResponse);
+assert.equal(postResponse.state.status, 200);
+assert.deepEqual(postResponse.json.changed, { json: false, terminal: false });
+const statePath = join(workspace, 'dsh-token-frugal.state.json');
+assert.ok(existsSync(statePath), `the choice must be persisted at ${statePath}`);
+assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf8')).modes.json, false);
+assert.ok(infos.some((line) => line.includes('modes changed via panel')));
 
+const afterToggle = exchange();
+await route.handler({ method: 'GET' }, afterToggle);
+assert.equal(afterToggle.json.modes.find((mode) => mode.id === 'json').on, false);
+console.log('POST toggled two modes, persisted them, and GET reports them off');
+
+const badResponse = exchange();
+await route.handler({
+  method: 'POST',
+  async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ modes: { teleport: true } })); },
+}, badResponse);
+assert.equal(badResponse.state.status, 400, 'an unknown mode must be a 400, not a silent no-op');
+
+const methodResponse = exchange();
+await route.handler({ method: 'DELETE' }, methodResponse);
+assert.equal(methodResponse.state.status, 405);
+console.log('an unknown mode is rejected, and an unsupported method gets 405');
+
+// ---------------------------------------------------------------------------
+// the Client half
+// ---------------------------------------------------------------------------
+const registrations = [];
+let loadedModule = null;
+globalThis.window = {
+  __ModuleLoader__: {
+    load(spec) { loadedModule = spec; },
+  },
+};
 try {
-  const loaded = await loadPlugin(pluginRoot, options);
-  const plugin = loaded.module;
-  sandbox = loaded.sandbox;
-  sandboxNeedsCleanup = sandbox !== undefined;
-  const root = loaded.root;
-
-  assert.equal(plugin.name, 'token-frugal');
-  assert.deepEqual(plugin.inject, ['tools']);
-  assert.equal(typeof plugin.apply, 'function');
-  assert.equal(typeof plugin.resolveConfig, 'function');
-  console.log(`exports ok: name=${plugin.name} inject=${JSON.stringify(plugin.inject)}`);
-
-  // --- the shipped patch must satisfy the plugin's own config validation ---
-  const { readPatchConfig, resolvePolicy } = await import(pathToFileURL(join(pluginRoot, 'tools', 'measure-tokens.mjs')).href);
-  const patchPath = join(root, 'cordis.patch.yml');
-  const rowConfig = readPatchConfig(patchPath);
-  assert.ok(rowConfig !== undefined, 'cordis.patch.yml must yield a config block');
-
-  const validated = plugin.resolveConfig(rowConfig);
-  assert.equal(validated.enabled, true);
-  assert.equal(validated.transforms.json, true);
-  console.log(`config validated from the patch: defaultMaxChars=${validated.defaultMaxChars} read=${validated.budgets.get('read')}`);
-
-  const bare = plugin.resolveConfig({});
-  assert.equal(bare.recovery, 'spill');
-  assert.equal(bare.budgets.get('read'), 3000);
-  assert.equal(bare.defaultMaxChars, 1500);
-  console.log(`defaults resolve for an empty config; ${Object.keys(plugin.FIELD_KINDS).length} fields are validated`);
-
-  // A typo in the patch must fail activation with a clear message, which is
-  // what a schemastery `Config` would have done before it was removed to keep
-  // this plugin importable from a profile.
-  let rejected;
-  try { plugin.resolveConfig({ ...rowConfig, notARealSetting: 1 }); } catch (error) { rejected = error.message; }
-  assert.match(String(rejected), /unknown config field "notARealSetting"/);
-  console.log('an undeclared config field is refused:', String(rejected).slice(0, 60));
-
-  // The offline policy loader must agree with the plugin about the fields.
-  let loaderRejected = false;
-  const badPatch = join(sandbox ?? tmpdir(), 'bad.patch.yml');
-  writeFileSync(badPatch, '- insert:\n    - id: token-frugal\n      name: dsh-token-frugal\n      config:\n        notARealSetting: 1\n');
-  try { resolvePolicy({ patch: badPatch, files: [], elide: true }); } catch { loaderRejected = true; }
-  assert.equal(loaderRejected, true, 'the policy loader must refuse a key the plugin does not declare');
-  console.log('the policy loader refuses the same field');
-
-  // --- drive apply() through a fake Cordis context -------------------------
-  const listeners = new Map();
-  const warned = [];
-  const infos = [];
-  const fakeCtx = {
-    on(event, handler) { listeners.set(event, handler); },
-    effect() { return () => {}; },
-    get() { return undefined; },
-    logger: { warn: (line) => warned.push(line), info: (line) => infos.push(line), debug: () => {} },
-    tools: { schemas: () => [] },
-  };
-  plugin.apply(fakeCtx, rowConfig);
-  assert.ok(listeners.has('tools/post-execute'), 'the post-execute listener must be registered');
-  assert.ok(infos.some((line) => line.includes('token-frugal: ready')), 'the startup line is missing');
-  assert.ok(!listeners.has('agent/created'), 'no agent/created listener is needed while hiddenTools is empty');
-  console.log('apply() registered tools/post-execute');
-
-  const next = async () => ({ kind: 'accept' });
-  /** The content the loop would log: the decision's replacement, or the original. */
-  const contentOf = (decision, original) => (decision.content ?? original.content)[0].text;
-
-  // Losslessly compressible (padding and repeated lines) but with unique
-  // payload lines, so the result stays well over any budget.
-  const oversized = Array.from({ length: 400 }, (_, i) => `row ${i} ${String(i * 7919).padStart(7)}    ${'q'.repeat(18)}      x${(i * i) % 977}   `).join('\n');
-  const exec = { name: 'pwsh', callId: 'call_1', arguments: {}, signal: undefined, agent: undefined };
-  const result = { isError: false, value: null, content: [{ type: 'text', text: oversized }] };
-
-  const lossless = await listeners.get('tools/post-execute')(exec, result, next);
-  const losslessText = contentOf(lossless, result);
-  assert.ok(losslessText.length < oversized.length, 'lossless compression must shrink the result');
-  assert.ok(losslessText.length > 1500, `the fixture must stay over budget, got ${losslessText.length}`);
-  assert.ok(
-    !losslessText.includes('elided by dsh-token-frugal'),
-    'without a recovery path the plugin must not drop unrecoverable text',
-  );
-  console.log(`lossless only, no recovery path: ${oversized.length} -> ${losslessText.length} chars, nothing dropped`);
-
-  // A `read` result is recoverable from its own path, so elision is allowed.
-  const readText = `<path>C:\\x\\big.ts</path>\n<type>file</type>\n<content>\n${Array.from({ length: 400 }, (_, i) => `${i + 1}: const v${i} = g(${i * 31}); // ${'n'.repeat(24)}`).join('\n')}\n</content>`;
-  const readDecision = await listeners.get('tools/post-execute')(
-    { ...exec, name: 'read' },
-    { isError: false, value: null, content: [{ type: 'text', text: readText }] },
-    next,
-  );
-  const readAfter = contentOf(readDecision, { content: [{ type: 'text', text: readText }] });
-  assert.ok(readAfter.length < readText.length, 'an oversized read must shrink');
-  assert.ok(readAfter.includes('elided by dsh-token-frugal'), 'read elision needs no spill backend');
-  assert.ok(readAfter.includes('C:\\x\\big.ts') && readAfter.includes('offset/limit'), 'the marker must name the file and the recovery move');
-  console.log(`read elided: ${readText.length} -> ${readAfter.length} chars`);
-  console.log(`marker: ${readAfter.split('\n').find((line) => line.includes('elided by'))}`);
-
-  // Decisions the plugin does not own must pass through untouched.
-  const blocked = { kind: 'block', feedback: [{ type: 'text', text: 'no' }] };
-  assert.equal(await listeners.get('tools/post-execute')(exec, result, async () => blocked), blocked);
-  const replaced = await listeners.get('tools/post-execute')(exec, result, async () => ({ kind: 'accept', value: { ok: true } }));
-  assert.equal(replaced.value.ok, true);
-  console.log('block and value-replacement decisions pass through');
-
-  // A compression fault must never turn a successful call into an error.
-  const hostile = { isError: false, value: null, content: [{ type: 'text', get text() { throw new Error('boom'); } }] };
-  const survived = await listeners.get('tools/post-execute')(exec, hostile, next);
-  assert.equal(survived.kind, 'accept');
-  assert.ok(warned.some((line) => line.includes('compression skipped')), 'the fault must be logged');
-  console.log('a compression fault degrades to the original decision');
-
-  // hiddenTools must register the agent/created half and survive an agent
-  // whose scoped context cannot accept a restriction.
-  const hiddenCtx = {
-    ...fakeCtx,
-    on(event, handler) { listeners.set(`hidden:${event}`, handler); },
-    tools: {
-      schemas: () => [{ name: 'workflow' }, { name: 'subagent_fork' }],
-      restrict: () => { throw new Error('scope rejected'); },
-    },
-  };
-  plugin.apply(hiddenCtx, { ...rowConfig, hiddenTools: ['workflow', 'nope'] });
-  assert.ok(listeners.has('hidden:agent/created'), 'hiddenTools must register agent/created');
-  await listeners.get('hidden:agent/created')({ agent: { id: 'session-1', ctx: { tools: {}, effect: (fn) => { fn(); return () => {}; } } } });
-  assert.ok(warned.some((line) => line.includes('nope')), 'an unknown hidden tool must be reported');
-  assert.ok(warned.some((line) => line.includes('could not hide tools')), 'a refused restriction must not break agent creation');
-  console.log('hiddenTools reports unknown names and survives a refused restriction');
-
-  console.log('\nLOAD CHECK PASSED');
+  await load('client.js');
 } finally {
-  if (sandboxNeedsCleanup && sandbox !== undefined) rmSync(sandbox, { recursive: true, force: true });
+  delete globalThis.window;
 }
+assert.ok(loadedModule !== null, 'client.js must register a module with the page loader');
+assert.equal(loadedModule.id, 'dsh-token-frugal', 'the module id must equal the package name');
+assert.equal(typeof loadedModule.factory, 'function');
+
+const fakeReact = {
+  createElement: () => null,
+  useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
+  useEffect: () => {},
+  useCallback: (fn) => fn,
+};
+let requiredNames = [];
+const clientPlugin = loadedModule.factory((name) => {
+  requiredNames.push(name);
+  assert.equal(name, 'react', 'the Client half may require React and nothing else');
+  return fakeReact;
+});
+assert.ok(clientPlugin.inject.includes('slots'));
+clientPlugin.apply({
+  get: () => undefined,
+  slots: {
+    inject: (slot, register) => { assert.equal(slot, 'conversation.composer.dock'); register(); },
+    register: (options, component) => { registrations.push({ options, component }); },
+  },
+});
+assert.equal(registrations.length, 1);
+assert.equal(registrations[0].options.name, 'conversation.composer.dock');
+assert.equal(typeof registrations[0].options.id, 'string');
+assert.equal(typeof registrations[0].options.order, 'number');
+assert.equal(typeof registrations[0].component, 'function', 'the slot must receive a component');
+assert.deepEqual(requiredNames, ['react']);
+console.log(`client half ok: id=${loadedModule.id} slot=${registrations[0].options.name} entry=${registrations[0].options.id}`);
+
+rmSync(workspace, { recursive: true, force: true });
+console.log('\nLOAD CHECK PASSED');

@@ -60,13 +60,11 @@ test('every field index.js validates is present in DEFAULT_CONFIG, and vice vers
   const extra = Object.keys(DEFAULT_CONFIG).filter((key) => !declared.includes(key));
   assert.deepEqual(extra, [], `DEFAULT_CONFIG has fields no validator covers: ${extra.join(', ')}`);
   // The plugin must not import a Harness package: a profile-installed bundle
-  // resolves from the profile, where those do not exist.
+  // resolves from the profile, where those do not exist. Node builtins are
+  // fine — a bundle inside the profile still runs on Node.
   const imports = [...source.matchAll(/^import .* from '([^']+)'/gm)].map((match) => match[1]);
-  assert.deepEqual(
-    imports.filter((specifier) => !specifier.startsWith('.')),
-    [],
-    'index.js must import only its own files',
-  );
+  const foreign = imports.filter((specifier) => !specifier.startsWith('.') && !specifier.startsWith('node:'));
+  assert.deepEqual(foreign, [], 'index.js may import only its own files and node: builtins');
 });
 
 test('skipTools bypasses a result entirely', () => {
