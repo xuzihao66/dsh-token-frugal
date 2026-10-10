@@ -543,7 +543,9 @@ export function apply(ctx, config) {
     try {
       if (!existsSync(memoPath)) {
         mkdirSync(dirname(memoPath), { recursive: true });
-        writeFileSync(memoPath, appendBlock('', sessionHeadingBlock(sessionId, cwd)));
+        // The extra newline keeps the first block off the session heading, so
+        // the file reads as blocks rather than one run-on heading stack.
+        writeFileSync(memoPath, `${appendBlock('', sessionHeadingBlock(sessionId, cwd))}\n`);
       } else if (!readFileSync(memoPath, 'utf8').includes(`## ${sessionId} `)) {
         appendFileSync(memoPath, `\n${sessionHeadingBlock(sessionId, cwd)}\n\n`);
       }
@@ -660,11 +662,13 @@ export function apply(ctx, config) {
   // -------------------------------------------------------------------------
   // 5. the panel bridge — an exact HTTP route the Client half fetches
   // -------------------------------------------------------------------------
-  const webServer = ctx.get('webServer');
-  if (webServer === undefined) {
-    ctx.logger.warn('token-frugal: no webServer service; the composer panel cannot reach this plugin');
-  } else {
-    ctx.effect(() => webServer.register({
+  // Register through `ctx.inject` rather than a one-shot `ctx.get`: this row
+  // activates as soon as `tools` is available, which can be before the web
+  // server finishes listening. A single check at apply time silently loses the
+  // route in that ordering, and the panel then 404s for the life of the
+  // process — which is exactly what the live check caught.
+  ctx.inject(['webServer'], (webCtx) => {
+    ctx.effect(() => webCtx.webServer.register({
       kind: 'exact',
       path: resolved.bridge.path,
       handler: async (request, response) => {
@@ -699,7 +703,7 @@ export function apply(ctx, config) {
         }
       },
     }), 'token-frugal: mode route');
-  }
+  });
 
   if (resolved.logStatsEvery > 0) {
     const budgets = [...resolved.budgets].map(([tool, chars]) => `${tool}=${chars}`).join(' ');

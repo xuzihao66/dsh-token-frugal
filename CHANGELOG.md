@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.0.1
+
+Fixes the saving-mode panel, which 2.0.0 shipped non-functional.
+
+The Host half registered its HTTP route with a one-shot `ctx.get('webServer')`
+at apply time. A row activates as soon as its `inject` services exist, and this
+row injects only `tools` — which is available earlier than the web server's
+listen. In that ordering the lookup returned `undefined`, the route was never
+registered, and the panel's fetch 404ed for the life of the process.
+
+The route is now registered through `ctx.inject(['webServer'], …)`, so it is
+created when the service arrives regardless of ordering. The integration check
+asserts that the plugin acquires the server that way, which is the regression
+guard for this defect; the live check caught it as a 404 on the real route.
+
+Everything else in 2.0.0 is unchanged, including the memory document, which was
+verified working in the same live check.
+
 ## 2.0.0
 
 Two new capabilities on top of 1.0.0's source-side compression. Both are

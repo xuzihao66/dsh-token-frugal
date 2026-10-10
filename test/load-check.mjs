@@ -79,6 +79,7 @@ console.log('undeclared fields, modes, and wrong types are all refused');
 // ---------------------------------------------------------------------------
 const listeners = new Map();
 const routes = new Map();
+const injections = [];
 const warnings = [];
 const infos = [];
 const injected = [];
@@ -103,9 +104,22 @@ const ctx = {
     return () => {};
   },
   effect: (fn) => { const disposer = fn(); return typeof disposer === 'function' ? disposer : () => {}; },
-  get: (name) => (name === 'webServer'
-    ? { register: (route) => { routes.set(route.path, route); return () => routes.delete(route.path); } }
-    : undefined),
+  // `inject` is how the plugin must acquire the web server: this row activates
+  // as soon as `tools` is ready, which can precede the server's listen. A
+  // one-shot `ctx.get('webServer')` lost the route in that ordering, which the
+  // live check caught as a 404.
+  inject: (deps, callback) => {
+    injections.push([...deps]);
+    if (deps.includes('webServer')) {
+      callback({
+        webServer: {
+          register: (route) => { routes.set(route.path, route); return () => routes.delete(route.path); },
+        },
+      });
+    }
+    return () => {};
+  },
+  get: () => undefined,
   logger: {
     warn: (line) => warnings.push(line),
     info: (line) => infos.push(line),
@@ -120,6 +134,10 @@ assert.ok(listeners.has('tools/post-execute'));
 assert.ok(listeners.has('agent/created'));
 assert.ok(listeners.has('agent/inbox/claimed'));
 assert.ok(listeners.has('session/event'));
+assert.ok(
+  injections.some((deps) => deps.includes('webServer')),
+  'the web server must be acquired through ctx.inject, not a one-shot ctx.get',
+);
 console.log('apply() registered post-execute, agent/created, inbox/claimed, session/event, and the route');
 
 // ---------------------------------------------------------------------------
