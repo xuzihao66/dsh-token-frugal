@@ -1,3 +1,5 @@
+！！！v2.0.1插件会出现某些不可控的问题
+
 # dsh-token-frugal
 
 Cut the input-token cost of a long DeepSeek Harness session without taking any
