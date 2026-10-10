@@ -227,6 +227,13 @@ window.__ModuleLoader__.load({
         open ? h('div', {
           style: {
             marginTop: '6px', padding: '10px', borderRadius: '10px',
+          // A definite width is required: this panel's dock wrapper sizes to
+          // its content (max-content), and an auto-repeat grid template sizes as
+          // a single repetition there, which is what collapsed the modes to one
+          // column. The width formula also keeps the card inside the viewport;
+          // the three columns just get narrower instead of overflowing.
+          width: 'min(640px, calc(100vw - 48px))', maxWidth: '100%',
+          boxSizing: 'border-box',
             border: '1px solid var(--dsw-alias-border-l1)',
             background: 'var(--dsw-alias-bg-layer-1)',
           },
@@ -253,7 +260,7 @@ window.__ModuleLoader__.load({
           h('div', {
             style: {
               display: 'grid', gap: '6px',
-              gridTemplateColumns: 'repeat(auto-fit, minmax(215px, 1fr))',
+              gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
             },
           }, (state?.modes ?? []).map((mode) => h(ModeRow, {
             key: mode.id, id: mode.id, on: mode.on, available: mode.available,

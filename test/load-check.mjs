@@ -355,7 +355,17 @@ assert.equal(
 
 const grid = panelNodes.find((node) => node.props.style?.display === 'grid');
 assert.ok(grid !== undefined, 'the modes must be laid out in a grid, not one long column');
-assert.match(String(grid.props.style.gridTemplateColumns), /minmax/, 'the grid must be multi-column');
+assert.equal(
+  String(grid.props.style.gridTemplateColumns),
+  'repeat(3, minmax(0, 1fr))',
+  'the modes must be exactly three columns',
+);
+const surface = panelNodes.find((node) => node.children.includes(grid));
+assert.match(
+  String(surface?.props?.style?.width ?? ''),
+  /^min\(/,
+  'the panel surface needs a definite width, or the grid collapses to a single column',
+);
 
 const panelCopy = JSON.stringify(panelNodes.map((node) => node.children));
 assert.ok(panelCopy.includes('已开'), 'the panel copy must be the pinned Chinese text');

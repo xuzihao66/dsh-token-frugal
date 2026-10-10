@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.0.3
+
+A layout fix: the mode grid is three columns.
+
+`repeat(auto-fit, minmax(215px, 1fr))` collapses to a single track when the
+container has no definite width, and the panel's dock wrapper is exactly that
+case -- it sizes to its content, so the nine modes still stacked in one column.
+The expanded surface now carries an explicit width
+(`min(640px, calc(100vw - 48px))`, capped at `100%`) and the grid uses a fixed
+`repeat(3, minmax(0, 1fr))` template: three columns on a normal window, and on a
+narrow one the columns get narrower instead of overflowing.
+
+The integration check now asserts the exact three-track template and that the
+surface carries a definite `min(...)` width, so a return to a single column
+fails the build.
+
 ## 2.0.2
 
 A presentation release: the panel speaks plainly and lays its modes out in
