@@ -297,9 +297,13 @@ assert.ok(loadedModule !== null, 'client.js must register a module with the page
 assert.equal(loadedModule.id, 'dsh-token-frugal', 'the module id must equal the package name');
 assert.equal(typeof loadedModule.factory, 'function');
 
+// React hooks are positional: seed one cell per hook the panel calls, in call
+// order (its state, then the open/busy/error toggles), so it can really render.
+const hookCells = [{ modes: getResponse.json.modes, profileDir: 'C:/profile' }, true, '', ''];
+let hookCursor = 0;
 const fakeReact = {
-  createElement: () => null,
-  useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
+  createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+  useState: (initial) => { const cell = hookCursor++; if (hookCells[cell] === undefined) hookCells[cell] = typeof initial === 'function' ? initial() : initial; return [hookCells[cell], () => {}]; },
   useEffect: () => {},
   useCallback: (fn) => fn,
 };
@@ -323,6 +327,42 @@ assert.equal(typeof registrations[0].options.id, 'string');
 assert.equal(typeof registrations[0].options.order, 'number');
 assert.equal(typeof registrations[0].component, 'function', 'the slot must receive a component');
 assert.deepEqual(requiredNames, ['react']);
+
+// The panel must actually build its element tree: a render fault is invisible to
+// every check above, and a lossy re-encode of the client half shows up here.
+hookCursor = 0;
+const tree = registrations[0].component({});
+const panelNodes = [];
+const collectNodes = (node) => {
+  if (node === null || node === undefined) return;
+  if (Array.isArray(node)) { node.forEach(collectNodes); return; }
+  if (typeof node !== 'object') return;
+  panelNodes.push(node);
+  // This stub React does not expand function components, so call them: the tree
+  // we inspect must be the one a browser would build.
+  if (typeof node.type === 'function') { collectNodes(node.type(node.props)); return; }
+  collectNodes(node.children);
+};
+collectNodes(tree);
+
+const switches = panelNodes.filter((node) => node.props.role === 'switch');
+assert.equal(switches.length, MODE_IDS.length, 'the expanded panel shows one switch per mode');
+assert.equal(
+  switches.filter((node) => node.props['aria-checked'] === 'true').length,
+  getResponse.json.modes.filter((mode) => mode.on && mode.available !== false).length,
+  'the switches must reflect the modes the route reported',
+);
+
+const grid = panelNodes.find((node) => node.props.style?.display === 'grid');
+assert.ok(grid !== undefined, 'the modes must be laid out in a grid, not one long column');
+assert.match(String(grid.props.style.gridTemplateColumns), /minmax/, 'the grid must be multi-column');
+
+const panelCopy = JSON.stringify(panelNodes.map((node) => node.children));
+assert.ok(panelCopy.includes('已开'), 'the panel copy must be the pinned Chinese text');
+assert.ok(panelCopy.includes('会话记忆'), 'every mode must carry its Chinese label');
+assert.ok(!panelCopy.includes('\uFFFD'), 'the panel copy must not contain replacement characters');
+assert.ok(!readFileSync(join(ROOT, 'client.js'), 'utf8').includes('\uFFFD'), 'client.js must stay valid UTF-8');
+console.log(`client panel ok: ${switches.length} switches in a grid, Chinese copy intact`);
 console.log(`client half ok: id=${loadedModule.id} slot=${registrations[0].options.name} entry=${registrations[0].options.id}`);
 
 rmSync(workspace, { recursive: true, force: true });

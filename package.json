@@ -1,6 +1,6 @@
 {
   "name": "dsh-token-frugal",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Cut the input-token cost of long Harness sessions: structure-aware tool-output compression, per-agent tool-catalogue visibility, a composer panel that turns each saving on or off, and a per-workspace session memory that is matched before the transcript is re-read.",
   "type": "module",
   "main": "./index.js",

@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.0.2
+
+A presentation release: the panel speaks plainly and lays its modes out in
+columns. No compression, catalogue, or memory behaviour changed.
+
+The nine modes had been named after their implementations — "terminal control
+codes", "numeric-run folding" — each with a line of developer prose, and the
+expanded panel stacked all nine in one column, so it read as a wall of small
+boxes. Each mode now says what it does in everyday words ("colour codes",
+"rising numbers", "trim long output", "hide tools"), and the modes sit in a grid
+(`repeat(auto-fit, minmax(215px, 1fr))`) inside a single surface: two columns at
+the panel's usual width, three when there is room.
+
+The panel's copy is pinned to Chinese by `PANEL_LOCALE` in `client.js`; the
+English dictionary stays in the same table, so switching back is a one-line
+change.
+
+The integration check now actually renders the panel with a stub React and
+asserts nine switches, a `display: grid` container with a `minmax` column
+template, the Chinese copy, and that `client.js` holds no U+FFFD replacement
+character. A lossy re-encode of that file — which had silently corrupted the
+panel once — now fails the check instead of reaching the browser.
+
 ## 2.0.1
 
 Fixes the saving-mode panel, which 2.0.0 shipped non-functional.
