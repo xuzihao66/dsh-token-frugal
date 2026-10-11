@@ -37,7 +37,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFil
 import { randomUUID } from 'node:crypto';
 import { dirname, isAbsolute, join } from 'node:path';
 import { compressContent, compressContentToBudget } from './lib/compress.js';
-import { contentChars } from './lib/estimate.js';
+import { CHARS_PER_TOKEN, contentChars, estimateToolsTokens } from './lib/estimate.js';
 import { DEFAULT_BRIDGE, DEFAULT_CONFIG, DEFAULT_MEMO, DEFAULT_RECALL } from './lib/defaults.js';
 import {
   MODE_IDS, effectivePolicy, modeAvailable, readState, resolveModes, sanitizeModePatch,
@@ -45,6 +45,10 @@ import {
 } from './lib/modes.js';
 import { appendBlock, extractPoints, parseMemo, summaryBlock, userBlock } from './lib/memo.js';
 import { renderRecall, selectExcerpts } from './lib/recall.js';
+import {
+  emptyStats, readStats, recordCall, recordCatalogue, recordRecall, recordRewrite,
+  recordSpillFailure, savedChars, statsFilePath, summarizeStats, toolRows, writeStats,
+} from './lib/stats.js';
 
 /** Cordis plugin identity. */
 export const name = 'token-frugal';
@@ -57,6 +61,8 @@ const SPILL_NOTICE = 'Full formatted result stored at:';
 const READ_PATH = /^<path>([\s\S]*?)<\/path>/;
 /** Largest memory document read back for matching, so a runaway file is bounded. */
 const MEMO_READ_LIMIT = 512 * 1024;
+/** How long saving statistics may sit unsaved after the last change. */
+const STATS_FLUSH_MS = 5_000;
 
 /** Lossless transforms that may be toggled individually. */
 const TRANSFORM_NAMES = Object.keys(DEFAULT_CONFIG.transforms);
@@ -378,6 +384,48 @@ export function apply(ctx, config) {
     recallBudget: resolved.recall.maxChars,
   });
 
+  // -------------------------------------------------------------------------
+  // statistics: what this process saved, and what every process before it saved
+  // -------------------------------------------------------------------------
+  const startedAt = new Date().toISOString();
+  const session = emptyStats();
+  let cumulative = readStats(stateDir);
+  const statsPath = statsFilePath(stateDir);
+  // The mode route's sibling. Derived rather than configured so a profile that
+  // already points the bridge elsewhere still gets both routes from one key.
+  const statsRoute = resolved.bridge.path.endsWith('/modes')
+    ? `${resolved.bridge.path.slice(0, -'/modes'.length)}/stats`
+    : `${resolved.bridge.path}/stats`;
+  let flushTimer;
+  const flushStats = () => writeStats(stateDir, cumulative);
+  /** Persist soon, not on every result: a burst of tool calls writes once. */
+  const scheduleFlush = () => {
+    if (stateDir === undefined || flushTimer !== undefined) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = undefined;
+      if (flushStats() === undefined) ctx.logger.warn(`token-frugal: could not persist statistics to ${statsPath}`);
+    }, STATS_FLUSH_MS);
+    flushTimer.unref?.();
+  };
+  ctx.effect(() => () => {
+    if (flushTimer === undefined) return;
+    clearTimeout(flushTimer);
+    flushTimer = undefined;
+    flushStats();
+  });
+
+  const statsPayload = () => ({
+    version: 2,
+    generatedAt: new Date().toISOString(),
+    startedAt,
+    charsPerToken: CHARS_PER_TOKEN,
+    profileDir: stateDir ?? null,
+    statsFile: statsPath ?? null,
+    cumulative: summarizeStats(cumulative),
+    session: summarizeStats(session),
+    tools: toolRows(session),
+  });
+
   for (const [label, value] of [['headRatio', resolved.headRatio], ['tailRatio', resolved.tailRatio]]) {
     if (value === 0) ctx.logger.warn(`token-frugal: ${label} is 0; that end of every elided result is dropped entirely`);
   }
@@ -388,7 +436,6 @@ export function apply(ctx, config) {
   // -------------------------------------------------------------------------
   // 1. tools/post-execute — compress the result that becomes the log event
   // -------------------------------------------------------------------------
-  const stats = { calls: 0, rewritten: 0, elided: 0, before: 0, after: 0, spillFailures: 0 };
   const baseOptions = () => ({
     transforms: policy.transforms,
     minBlockChars: resolved.minBlockChars,
@@ -428,14 +475,34 @@ export function apply(ctx, config) {
       });
       return `Full text saved at ${ref.locator}: ${ref.retrievalHint}`;
     } catch (error) {
-      stats.spillFailures += 1;
+      recordSpillFailure(session);
+      recordSpillFailure(cumulative);
+      scheduleFlush();
       ctx.logger.warn(`token-frugal: spill of ${exec.name} failed (${String(error)}); keeping the result lossless-only`);
       return undefined;
     }
   }
 
+  /**
+   * The waterfall contract: every `tools/post-execute` listener returns the
+   * decision it received, a replacement decision, or nothing at all. A sibling
+   * listener that returns nothing makes `next()` resolve `undefined`, and
+   * reading `.kind` off that value throws "Cannot read properties of undefined
+   * (reading 'kind')" inside the tool pipeline. Restore the discriminator the
+   * pipeline requires — the same `{ kind: 'accept' }` the pipeline's own
+   * terminal returns — instead of trusting the awaited value, and hand the
+   * repaired decision outward so one misbehaving listener cannot break this
+   * plugin or the listeners registered before it.
+   * @param value - whatever `next()` resolved.
+   * @returns a decision object that always carries a `kind`.
+   */
+  const asDecision = (value) => {
+    if (value === null || typeof value !== 'object') return { kind: 'accept' };
+    return typeof value.kind === 'string' ? value : { ...value, kind: 'accept' };
+  };
+
   ctx.on('tools/post-execute', async (exec, result, next) => {
-    const decision = await next();
+    const decision = asDecision(await next());
     if (decision.kind !== 'accept') return decision;
     // A value replacement re-renders content from the new value; rewriting it
     // here would fight the definition that owns the projection.
@@ -443,7 +510,8 @@ export function apply(ctx, config) {
     if (resolved.skipTools.has(exec.name)) return decision;
     const content = decision.content ?? result.content;
     if (!Array.isArray(content) || content.length === 0) return decision;
-    stats.calls += 1;
+    recordCall(session, exec.name);
+    recordCall(cumulative, exec.name);
 
     try {
       const options = baseOptions();
@@ -479,15 +547,14 @@ export function apply(ctx, config) {
       const after = contentChars(blocks);
       const before = contentChars(content);
       if (after >= before) return decision;
-      stats.rewritten += 1;
-      if (elided) stats.elided += 1;
-      stats.before += before;
-      stats.after += after;
-      if (resolved.logStatsEvery > 0 && stats.rewritten % resolved.logStatsEvery === 0) {
+      recordRewrite(session, exec.name, before, after, elided);
+      recordRewrite(cumulative, exec.name, before, after, elided);
+      scheduleFlush();
+      if (resolved.logStatsEvery > 0 && session.rewritten % resolved.logStatsEvery === 0) {
         ctx.logger.debug(
-          `token-frugal: ${stats.rewritten}/${stats.calls} results rewritten, `
-          + `${stats.elided} elided, ${stats.before} -> ${stats.after} chars `
-          + `(${(100 * (1 - stats.after / stats.before)).toFixed(1)}% saved)`,
+          `token-frugal: ${session.rewritten}/${session.calls} results rewritten, `
+          + `${session.elided} elided, ${savedChars(session)} chars saved `
+          + `(${(100 * (1 - session.after / session.before)).toFixed(1)}% saved)`,
         );
       }
       return {
@@ -515,11 +582,19 @@ export function apply(ctx, config) {
     const agentCtx = agent?.ctx;
     if (agentCtx?.tools === undefined) return undefined;
     try {
-      const visible = new Set(ctx.tools.schemas(agent).map((schema) => schema.name));
+      const schemas = ctx.tools.schemas(agent);
+      const visible = new Set(schemas.map((schema) => schema.name));
       const deny = resolved.hiddenTools.filter((tool) => visible.has(tool));
       const missing = resolved.hiddenTools.filter((tool) => !visible.has(tool));
       if (missing.length > 0) ctx.logger.warn(`token-frugal: hiddenTools names unknown tool(s) ${missing.join(', ')}; ignoring them`);
       if (deny.length === 0) return undefined;
+      // Price what the restriction removes from the catalogue. The schemas are
+      // the measurable part of the saving and are paid on every request, so
+      // the page reports this per request rather than as a running total.
+      const tokens = estimateToolsTokens(schemas.filter((schema) => deny.includes(schema.name)));
+      recordCatalogue(session, deny.length, tokens);
+      recordCatalogue(cumulative, deny.length, tokens);
+      scheduleFlush();
       return agentCtx.effect(() => agentCtx.tools.restrict({ deny }), { label: `token-frugal: hide ${deny.join(', ')}` });
     } catch (error) {
       ctx.logger.warn(`token-frugal: could not hide tools for agent ${agent?.id}: ${String(error)}`);
@@ -627,6 +702,9 @@ export function apply(ctx, config) {
       // Append-only: an `agent/inbox/spliced` event the model sees next step, so
       // the request prefix stays intact for the provider's cache.
       agent.inject?.({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: rendered }] });
+      recordRecall(session, rendered.length);
+      recordRecall(cumulative, rendered.length);
+      scheduleFlush();
       ctx.logger.debug(
         `token-frugal: recalled ${selection.excerpts.length} block(s), ${selection.chars} chars, `
         + `terms=[${selection.matchedTerms.slice(0, 8).join(',')}]`,
@@ -703,6 +781,41 @@ export function apply(ctx, config) {
         }
       },
     }), 'token-frugal: mode route');
+
+    // The settings page reads the same record the composer panel's switches
+    // feed, and may clear the cumulative half. Kept on its own route so a
+    // read-only statistics request can never be mistaken for a policy change.
+    ctx.effect(() => webCtx.webServer.register({
+      kind: 'exact',
+      path: statsRoute,
+      handler: async (request, response) => {
+        try {
+          if (request.method === 'GET') {
+            sendJson(response, 200, statsPayload());
+            return;
+          }
+          if (request.method !== 'POST') {
+            response.writeHead(405, { allow: 'GET, POST' });
+            response.end();
+            return;
+          }
+          const body = await readJsonBody(request);
+          if (body?.reset !== true) {
+            sendJson(response, 400, { error: 'unsupported request; send {"reset": true} to clear the cumulative record' });
+            return;
+          }
+          cumulative = emptyStats();
+          const path = writeStats(stateDir, cumulative);
+          ctx.logger.info(
+            'token-frugal: cumulative statistics reset from the settings page; '
+            + `${path === undefined ? 'NOT persisted (no profile directory)' : `cleared ${path}`}`,
+          );
+          sendJson(response, 200, { ...statsPayload(), reset: true, persistedTo: path ?? null });
+        } catch (error) {
+          sendJson(response, 400, { error: String(error?.message ?? error) });
+        }
+      },
+    }), 'token-frugal: stats route');
   });
 
   if (resolved.logStatsEvery > 0) {
@@ -711,7 +824,8 @@ export function apply(ctx, config) {
     ctx.logger.info(
       `token-frugal: ready (defaultMaxChars=${resolved.defaultMaxChars} budgets= ${budgets}) `
       + `modes=[${on.join(',')}] memo=${resolved.memo.enabled ? resolved.memo.path : 'off'} `
-      + `recall=${resolved.recall.enabled ? `${resolved.recall.maxChars}chars` : 'off'} bridge=${resolved.bridge.path}`,
+      + `recall=${resolved.recall.enabled ? `${resolved.recall.maxChars}chars` : 'off'} bridge=${resolved.bridge.path} `
+      + `stats=${statsRoute}`,
     );
   }
 }

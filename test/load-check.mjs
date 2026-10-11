@@ -174,6 +174,20 @@ assert.equal((await listeners.get('tools/post-execute')[0](exec, hostile, next))
 assert.ok(warnings.some((line) => line.includes('compression skipped')));
 console.log('block and value decisions pass through; a fault degrades to the original decision');
 
+// A sibling listener that returns nothing makes `next()` resolve `undefined`.
+// Reading `.kind` off that value is exactly the field failure
+// (`Cannot read properties of undefined (reading 'kind')` inside the tool
+// pipeline), so the hook repairs the decision instead of trusting it.
+const hook = listeners.get('tools/post-execute')[0];
+const orphaned = await hook(exec, result, async () => undefined);
+assert.equal(orphaned.kind, 'accept', 'a listener that returns nothing must not crash the hook');
+assert.ok(contentOf(orphaned, result).length < oversized.length, 'the repaired decision still compresses');
+const partial = await hook(exec, result, async () => ({ content: [{ type: 'text', text: 'kept' }] }));
+assert.equal(partial.kind, 'accept', 'a decision missing its discriminator gets one back');
+assert.equal(partial.content[0].text, 'kept', 'the fields a sibling did return survive the repair');
+assert.equal(await hook(exec, result, async () => null).then((value) => value.kind), 'accept');
+console.log('a sibling that returns nothing is repaired to { kind: "accept" } instead of crashing the hook');
+
 // ---------------------------------------------------------------------------
 // the memory document and recall
 // ---------------------------------------------------------------------------
@@ -279,6 +293,55 @@ assert.equal(methodResponse.state.status, 405);
 console.log('an unknown mode is rejected, and an unsupported method gets 405');
 
 // ---------------------------------------------------------------------------
+// the statistics route
+// ---------------------------------------------------------------------------
+// Derived from the bridge path, not configured separately: a profile that points
+// the bridge elsewhere must still get both routes from that one key.
+const statsRoute = routes.get('/dsh-token-frugal/stats');
+assert.ok(statsRoute !== undefined, 'the statistics route must be registered beside the mode route');
+assert.equal(statsRoute.kind, 'exact');
+
+const statsResponse = exchange();
+await statsRoute.handler({ method: 'GET' }, statsResponse);
+assert.equal(statsResponse.state.status, 200);
+assert.equal(statsResponse.state.headers['cache-control'], 'no-store');
+const report = statsResponse.json;
+assert.equal(report.version, 2);
+assert.equal(report.charsPerToken, 4);
+assert.ok(report.session.savedChars > 0, 'the compressions this run already performed must be counted');
+assert.ok(report.session.rewritten > 0, 'a rewritten result must be counted');
+assert.ok(report.session.calls >= report.session.rewritten, 'every rewrite is also an inspected call');
+assert.ok(report.session.savedTokens > 0, 'the saving must be priced in tokens');
+assert.ok(report.session.savedRatio > 0 && report.session.savedRatio <= 1, 'the saved share is a ratio');
+assert.ok(Array.isArray(report.tools) && report.tools.length > 0, 'the report must break the saving down by tool');
+assert.ok(report.tools.some((row) => row.tool === 'read' && row.savedChars > 0), 'the elided read must appear in the breakdown');
+assert.equal(typeof report.statsFile, 'string');
+assert.ok(report.statsFile.endsWith('dsh-token-frugal.stats.json'), `unexpected statistics file: ${report.statsFile}`);
+assert.ok(typeof report.generatedAt === 'string' && !Number.isNaN(Date.parse(report.generatedAt)));
+console.log(`GET ${statsRoute.path} -> ${report.session.savedChars} chars saved across ${report.tools.length} tool(s)`);
+
+const resetResponse = exchange();
+await statsRoute.handler({
+  method: 'POST',
+  async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ reset: true })); },
+}, resetResponse);
+assert.equal(resetResponse.state.status, 200);
+assert.equal(resetResponse.json.cumulative.savedChars, 0, 'clearing must zero the all-time record');
+assert.equal(resetResponse.json.session.savedChars, report.session.savedChars, 'clearing must keep the current process record');
+
+const statsBad = exchange();
+await statsRoute.handler({
+  method: 'POST',
+  async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ nope: true })); },
+}, statsBad);
+assert.equal(statsBad.state.status, 400, 'an unsupported body must be refused');
+
+const statsMethod = exchange();
+await statsRoute.handler({ method: 'PUT' }, statsMethod);
+assert.equal(statsMethod.state.status, 405);
+console.log('the statistics route reports, clears the all-time half, and refuses bad input');
+
+// ---------------------------------------------------------------------------
 // the Client half
 // ---------------------------------------------------------------------------
 const registrations = [];
@@ -297,9 +360,10 @@ assert.ok(loadedModule !== null, 'client.js must register a module with the page
 assert.equal(loadedModule.id, 'dsh-token-frugal', 'the module id must equal the package name');
 assert.equal(typeof loadedModule.factory, 'function');
 
-// React hooks are positional: seed one cell per hook the panel calls, in call
-// order (its state, then the open/busy/error toggles), so it can really render.
-const hookCells = [{ modes: getResponse.json.modes, profileDir: 'C:/profile' }, true, '', ''];
+// React hooks are positional: seed one cell per hook the composer panel calls,
+// in call order (loaded state, expanded flag, open grade, busy id, error), so it
+// can really render.
+let hookCells = [{ modes: getResponse.json.modes, profileDir: 'C:/profile' }, true, '', '', ''];
 let hookCursor = 0;
 const fakeReact = {
   createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
@@ -317,63 +381,154 @@ assert.ok(clientPlugin.inject.includes('slots'));
 clientPlugin.apply({
   get: () => undefined,
   slots: {
-    inject: (slot, register) => { assert.equal(slot, 'conversation.composer.dock'); register(); },
+    inject: (slot, register) => {
+      assert.ok(
+        ['conversation.composer.dock', 'settings.section'].includes(slot),
+        `the client half mounted into an unexpected slot: ${slot}`,
+      );
+      register();
+    },
     register: (options, component) => { registrations.push({ options, component }); },
   },
 });
-assert.equal(registrations.length, 1);
-assert.equal(registrations[0].options.name, 'conversation.composer.dock');
-assert.equal(typeof registrations[0].options.id, 'string');
-assert.equal(typeof registrations[0].options.order, 'number');
-assert.equal(typeof registrations[0].component, 'function', 'the slot must receive a component');
+assert.equal(registrations.length, 2, 'the client half mounts the composer panel and one settings page');
+
+const composer = registrations.find((entry) => entry.options.name === 'conversation.composer.dock');
+const settings = registrations.find((entry) => entry.options.name === 'settings.section');
+assert.ok(composer !== undefined, 'the composer panel must be registered');
+assert.ok(settings !== undefined, 'the settings page must be registered');
+assert.equal(typeof composer.options.id, 'string');
+assert.equal(typeof composer.options.order, 'number');
+assert.equal(typeof composer.component, 'function', 'the slot must receive a component');
+assert.equal(typeof settings.options.id, 'string');
+assert.equal(typeof settings.options.order, 'number');
+assert.equal(typeof settings.component, 'function');
+assert.equal(typeof settings.options.label(), 'string', 'the settings page needs a nav label');
 assert.deepEqual(requiredNames, ['react']);
 
 // The panel must actually build its element tree: a render fault is invisible to
 // every check above, and a lossy re-encode of the client half shows up here.
-hookCursor = 0;
-const tree = registrations[0].component({});
-const panelNodes = [];
-const collectNodes = (node) => {
-  if (node === null || node === undefined) return;
-  if (Array.isArray(node)) { node.forEach(collectNodes); return; }
-  if (typeof node !== 'object') return;
-  panelNodes.push(node);
-  // This stub React does not expand function components, so call them: the tree
-  // we inspect must be the one a browser would build.
-  if (typeof node.type === 'function') { collectNodes(node.type(node.props)); return; }
-  collectNodes(node.children);
+const collectNodes = (root, nodes = []) => {
+  const walk = (node) => {
+    if (node === null || node === undefined) return;
+    if (Array.isArray(node)) { node.forEach(walk); return; }
+    if (typeof node !== 'object') return;
+    nodes.push(node);
+    // This stub React does not expand function components, so call them: the tree
+    // we inspect must be the one a browser would build.
+    if (typeof node.type === 'function') { walk(node.type(node.props)); return; }
+    walk(node.children);
+  };
+  walk(root);
+  return nodes;
 };
-collectNodes(tree);
 
-const switches = panelNodes.filter((node) => node.props.role === 'switch');
-assert.equal(switches.length, MODE_IDS.length, 'the expanded panel shows one switch per mode');
+/** Render the composer panel with one grade open; '' leaves every grade shut. */
+const renderPanel = (grade) => {
+  hookCells[2] = grade;
+  hookCursor = 0;
+  return collectNodes(composer.component({}));
+};
+
+const collapsed = renderPanel('');
 assert.equal(
-  switches.filter((node) => node.props['aria-checked'] === 'true').length,
+  collapsed.filter((node) => node.props.role === 'switch').length,
+  0,
+  'every grade starts collapsed, so no switch is on screen yet',
+);
+const gradeHeaders = collapsed.filter(
+  (node) => node.props['aria-expanded'] !== undefined && node.props.style?.width === '100%',
+);
+assert.equal(gradeHeaders.length, 3, 'the collapsed panel lists exactly three grades');
+
+// The panel renders the grades, not the mode list, so a mode missing from the
+// grade table would vanish from the UI with no other symptom. Opening each grade
+// in turn must therefore surface every mode exactly once.
+const labels = new Set();
+let checkedCount = 0;
+let switchesSeen = 0;
+for (const grade of ['basic', 'medium', 'advanced']) {
+  const opened = renderPanel(grade);
+  const gradeSwitches = opened.filter((node) => node.props.role === 'switch');
+  assert.ok(gradeSwitches.length > 0, `grade ${grade} must render its switches`);
+  switchesSeen += gradeSwitches.length;
+  for (const node of gradeSwitches) {
+    labels.add(node.props['data-mode']);
+    if (node.props['aria-checked'] === 'true') checkedCount += 1;
+  }
+}
+assert.equal(labels.size, MODE_IDS.length, 'the three grades must cover every mode');
+assert.deepEqual([...labels].sort(), [...MODE_IDS].sort(), 'no mode may be missing or duplicated');
+assert.equal(switchesSeen, MODE_IDS.length, 'a mode must appear in exactly one grade');
+assert.equal(
+  checkedCount,
   getResponse.json.modes.filter((mode) => mode.on && mode.available !== false).length,
   'the switches must reflect the modes the route reported',
 );
 
-const grid = panelNodes.find((node) => node.props.style?.display === 'grid');
-assert.ok(grid !== undefined, 'the modes must be laid out in a grid, not one long column');
-assert.equal(
-  String(grid.props.style.gridTemplateColumns),
-  'repeat(3, minmax(0, 1fr))',
-  'the modes must be exactly three columns',
-);
-const surface = panelNodes.find((node) => node.children.includes(grid));
-assert.match(
-  String(surface?.props?.style?.width ?? ''),
-  /^min\(/,
-  'the panel surface needs a definite width, or the grid collapses to a single column',
+// The dock wrapper sizes to its content, so the panel surface needs a definite
+// width; without one the rows collapse into an unusably narrow column.
+const surface = renderPanel('basic').find((node) => String(node.props.style?.width ?? '').startsWith('min('));
+assert.ok(surface !== undefined, 'the panel surface needs a definite width');
+assert.ok(
+  renderPanel('basic').some((node) => String(node.props.style?.justifyContent ?? '') === 'flex-end'),
+  'an open grade must offer its one-click set-all control',
 );
 
-const panelCopy = JSON.stringify(panelNodes.map((node) => node.children));
+const panelCopy = JSON.stringify(collapsed.map((node) => node.children));
+assert.ok(panelCopy.includes('初等') && panelCopy.includes('中等') && panelCopy.includes('高等'), 'the three grades carry their Chinese names');
 assert.ok(panelCopy.includes('已开'), 'the panel copy must be the pinned Chinese text');
-assert.ok(panelCopy.includes('会话记忆'), 'every mode must carry its Chinese label');
 assert.ok(!panelCopy.includes('\uFFFD'), 'the panel copy must not contain replacement characters');
+
+// The settings page renders the host's running record, including the per-tool
+// breakdown: an empty or faulting render would leave the whole feature invisible.
+hookCells = [{
+  session: {
+    calls: 4, rewritten: 3, elided: 1, before: 20000, after: 8000,
+    savedChars: 12, savedTokens: 3, savedRatio: 0.6, spillFailures: 0,
+    catalogueTools: 0, catalogueTokens: 0, recallInjections: 0, recallChars: 0,
+  },
+  cumulative: {
+    calls: 4, rewritten: 3, elided: 1, before: 20000, after: 8000,
+    savedChars: 12000, savedTokens: 3000, savedRatio: 0.6, spillFailures: 1,
+    catalogueTools: 2, catalogueTokens: 900, recallInjections: 1, recallChars: 300,
+  },
+  tools: [{ tool: 'read', calls: 3, rewritten: 3, elided: 1, savedChars: 12000, savedTokens: 3000, savedRatio: 1 }],
+  statsFile: 'C:/profile/dsh-token-frugal.stats.json',
+  generatedAt: '2026-01-02T03:04:05.000Z',
+}, '', '', ''];
+hookCursor = 0;
+const pageNodes = collectNodes(settings.component({}));
+const pageText = JSON.stringify(pageNodes.map((node) => node.children));
+assert.ok(pageText.includes('省 Token 统计'), 'the settings page must carry its Chinese title');
+assert.ok(pageText.includes('read'), 'the per-tool table must render its rows');
+assert.ok(pageText.includes('12.0k'), 'large counts must be compacted, not printed raw');
+assert.ok(pageText.includes('C:/profile/dsh-token-frugal.stats.json'), 'the page must name its statistics file');
+assert.ok(!pageText.includes('\uFFFD'), 'the settings copy must not contain replacement characters');
 assert.ok(!readFileSync(join(ROOT, 'client.js'), 'utf8').includes('\uFFFD'), 'client.js must stay valid UTF-8');
-console.log(`client panel ok: ${switches.length} switches in a grid, Chinese copy intact`);
-console.log(`client half ok: id=${loadedModule.id} slot=${registrations[0].options.name} entry=${registrations[0].options.id}`);
+
+// The Theme provider exposes a fixed token set and nothing else. An invented
+// variable renders as no colour at all: invisible in a stub render, and obvious
+// to the user as a switch or a bar that has no background.
+const THEME_TOKENS = [
+  '--dsw-alias-bg-base', '--dsw-alias-bg-layer-1', '--dsw-alias-bg-layer-2',
+  '--dsw-alias-bg-overlay', '--dsw-alias-border-l1', '--dsw-alias-border-l2',
+  '--dsw-alias-brand-primary', '--dsw-alias-label-primary', '--dsw-alias-label-secondary',
+  '--dsw-alias-state-error-primary', '--dsw-alias-state-idle-primary', '--dsw-alias-state-success-primary',
+];
+const usedTokens = [
+  ...new Set(
+    [...readFileSync(join(ROOT, 'client.js'), 'utf8').matchAll(/var\((--[a-z0-9-]+)\)/g)].map((match) => match[1]),
+  ),
+];
+assert.ok(usedTokens.length > 0, 'the client half must colour itself from theme tokens');
+for (const token of usedTokens) {
+  assert.ok(THEME_TOKENS.includes(token), `client.js uses ${token}, which the Theme provider does not expose`);
+}
+console.log(`client theme ok: ${usedTokens.length} tokens, every one declared by the Theme provider`);
+console.log(`client settings page ok: ${pageNodes.length} nodes rendered`);
+console.log(`client panel ok: ${MODE_IDS.length} modes across ${gradeHeaders.length} grades, Chinese copy intact`);
+console.log(`client half ok: id=${loadedModule.id} slots=${registrations.map((entry) => entry.options.name).join('+')}`);
 
 rmSync(workspace, { recursive: true, force: true });
 console.log('\nLOAD CHECK PASSED');

@@ -1,5 +1,75 @@
 # Changelog
 
+## 2.0.4
+
+Two changes: a statistics page that reports what was saved, and a panel whose copy
+is precise and whose nine switches are grouped into three grades. No compression,
+catalogue, or memory behaviour changed.
+
+**A statistics page inside Settings.** The Host half now keeps a running record —
+tool results inspected and rewritten, characters removed, the estimated token
+value of them, a per-tool breakdown, catalogue savings, recall injections, and
+spill failures — and serves it from a second exact route derived from the same
+bridge key (`/dsh-token-frugal/stats`, so a profile that moves the bridge moves
+both). `lib/stats.js` holds the record: `recordCall/recordRewrite/recordRecall/
+recordCatalogue/recordSpillFailure` mutate a counter object, `summarizeStats`
+prices it at the Harness's own 4-characters-per-token heuristic, and the
+cumulative half is persisted next to the mode state at most once every five
+seconds. The page renders that record: an all-time hero figure, the current
+process beside the all-time total, the per-tool table, and a two-step "clear
+all-time record" that leaves the running process figures alone.
+
+The catalogue figure is per request, not a total: while the tool-catalogue
+restriction is active, every request the agent makes is missing those schemas, so
+"2 tools hidden · about 900 tokens per request" is the only honest way to print
+it.
+
+**Persistence now reaches the profile the app actually runs in.** Both records are
+written beside the profile, but the app process exports none of `DSH_PROFILE_DIR`,
+`DSH_HOME`, or `DSH_PROFILE` (the tool calls it spawns do), so `stateDirectory()`
+returned `undefined` and every choice was session-only. It now falls back to the
+single profile under `~/.dsh/profiles` that either holds this package or already
+holds a `dsh-token-frugal` file; two candidates yield no directory at all, because
+scattering state across profiles is worse than not persisting. The panel keeps
+working either way, and the statistics page labels an unpersisted all-time half
+instead of showing an incomplete total as if it were complete.
+
+**The panel speaks precisely, in three grades.** The nine switches were a flat
+list named in everyday words ("colour codes", "rising numbers", "hide tools")
+that hid what each one actually does. They are now grouped by what a wrong choice
+costs — 初等 (`terminal`, `columns`, `json`) is lossless by construction, 中等
+(`repeatedLines`, `numericRuns`) folds structure that the text itself encodes,
+高等 (`elide`, `catalogue`, `memo`, `recall`) either drops content or changes what
+the model is shown — and each mode states the exact thing it removes or folds,
+plus whether the change is reversible. The card is an accordion: opening one
+grade closes the others, so the panel is never taller than one grade, and each
+grade carries a one-click set-all control.
+
+The panel is wider than the pill it replaced, so the integration check now also
+proves that the three grades cover every mode exactly once: the panel renders the
+grades, not the mode list, so a mode left out of the grade table would vanish
+from the UI with no other symptom.
+
+`client.js` now declares `@deepseek-ai/dsh-client-runtime` and
+`@deepseek-ai/dsh-client-ui-slots` in `dsh.client.inject`, because the settings
+page mounts into `settings.section`, which the slots package owns.
+
+**A listener that returns nothing no longer breaks the tool pipeline.** The
+`tools/post-execute` waterfall hands every listener the decision its neighbours
+returned, and the Host's own listeners read `.kind` off that value
+(`dsh-spill-policy` registers with `{ prepend: true }`, so it sees whatever the
+listeners inside it produced). A sibling listener that returns `undefined` —
+legal for a Cordis hook, and something this plugin has to survive either way —
+made that read throw `Cannot read properties of undefined (reading 'kind')`,
+which is the `gateway/internal` failure reported from a profile install. The hook
+now restores the discriminator the pipeline requires (the same
+`{ kind: 'accept' }` the pipeline's own terminal returns) instead of trusting the
+awaited value, keeps every field a sibling did return, and passes the repaired
+decision outward, so one misbehaving listener can neither crash this plugin nor
+the listeners registered before it. The integration check drives the hook with a
+`next` that resolves `undefined`, with `null`, and with a decision that carries no
+`kind`, and asserts the repaired result.
+
 ## 2.0.3
 
 A layout fix: the mode grid is three columns.

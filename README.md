@@ -10,11 +10,13 @@ plus a panel that puts every saving under your control:
 | `tools/post-execute` | Compresses each accepted tool result before it is logged: lossless structure-aware transforms first, then a budgeted head/tail elision whose marker names a recovery path. |
 | `agent/created` | Hides configured tools from one agent through `ctx.tools.restrict()` on that agent's scoped context, which the loop records as `tool-removal` / `tool-addition` blocks, and opens this conversation's section in the workspace memory document. |
 | `agent/inbox/claimed` | Matches a new user message against that document and injects the best excerpts with `agent.inject()`, which appends an `agent/inbox/spliced` event rather than rewriting history. |
-| `conversation.composer.dock` | The panel: one switch per saving, applied to the live session and persisted next to the profile. |
+| `conversation.composer.dock` | The panel: the savings grouped into three grades — 初等 (lossless), 中等 (folding), 高等 (trimming and rewrites) — one switch per saving, applied to the live session and persisted next to the profile. |
+| `settings.section` | The statistics page: the running and all-time record of what the savings actually removed, priced at the Harness's own 4-characters-per-token heuristic. |
 
 **New in 2.0.0** — the saving-mode panel and the workspace memory with recall;
-see [`CHANGELOG.md`](./CHANGELOG.md). Version 1.0.0's behaviour and config keys
-are unchanged.
+**new in 2.0.4** — the graded panel and the statistics page; see
+[`CHANGELOG.md`](./CHANGELOG.md). Version 1.0.0's behaviour and config keys are
+unchanged.
 
 Measured on this machine over the four completed recorded sessions (149 model
 requests, 8.6 M baseline prompt tokens, dominated by web-fetch, terminal, and
@@ -33,45 +35,114 @@ matches) in exchange for not re-reading the transcript.
 
 ## The saving-mode panel
 
-A pill sits under the composer. It shows how many savings are on and opens a
-list of all nine, each with a switch:
+A pill sits under the composer. It shows how many savings are on and opens three
+grades of them, each with a switch:
 
 ```
-▾ Token savings                     11/9 savings on   applied to this session immediately; no restart.
-  ● Terminal noise    Strip ANSI escapes and carriage-return repaints.        [switch]
-  ● Column padding    Collapse alignment padding, keeping indentation.        [switch]
-  ● Repeated lines    Fold runs of identical lines into a count.              [switch]
-  ● Counting runs     Fold build counters and timestamps into a range.        [switch]
-  ● JSON              Minify JSON and tabulate homogeneous arrays.            [switch]
-  ● Head/tail trim    Bound oversized results; every cut names a recovery path.
-  ● Tool catalogue    Hide tools you do not want offered.      (only if hiddenTools is set)
-  ● Session memory    Record your inputs and turn digests into the workspace.
-  ● Recall            Match a new message against that memory and inject the hits.
-  Saved to C:\Users\you\.dsh\profiles\desktop
+▾ 省 Token · 已开 6/9        改动立即生效，无需重启。
+  初等   只清理空白与控制符，不改变任何语义内容                      3/3  ▸
+  中等   把重复行与递增计数折叠成区间，内容可无损还原                2/2  ▾
+        [全部关闭]
+        ● 重复行折叠   把连续重复的同一行合并为一行并标注出现次数     [switch]
+        ● 递增计数折叠 把连续递增的计数折叠为「起始-结束」区间         [switch]
+  高等   截断超长结果并改写模型可见内容，存在信息取舍                1/4  ▸
+  完整节省统计：设置 → 省 Token 统计
+  设置文件 C:\Users\you\.dsh\profiles\desktop
 ```
+
+The grades are ordered by what a wrong choice costs. **初等** (`terminal`,
+`columns`, `json`) is lossless by construction: it only removes whitespace,
+colour, and layout that carries no meaning. **中等** (`repeatedLines`,
+`numericRuns`) folds structure that the text itself encodes — a run of identical
+lines, a rising counter — so the original is reconstructable from what is left.
+**高等** (`elide`, `catalogue`, `memo`, `recall`) either drops content or changes
+what the model is shown, and each of those carries a real trade-off. Every mode
+names the exact thing it removes or folds, and says whether that is reversible,
+because the switch's own label is the only documentation read before flipping it.
+
+The card is an accordion: opening one grade closes the others, so the panel is
+never taller than a single grade. Each grade carries a one-click set-all control.
 
 Turning a switch applies it to the running session at once — no restart, and no
 edit to your profile: the choice is written to `dsh-token-frugal.state.json`
-beside the profile. `catalogue` is re-applied to agents that already exist, not
-only to ones created later. A mode whose prerequisite is missing (`catalogue`
-with an empty `hiddenTools`) is shown greyed and explained rather than silently
-doing nothing.
+beside the profile. The profile is taken from `DSH_PROFILE_DIR` (or `DSH_HOME`
+plus `DSH_PROFILE`) when the harness advertises one, and otherwise discovered:
+the single profile that holds this package or an earlier `dsh-token-frugal`
+state file. The app process itself exports none of those variables, so the
+discovery is what makes this file appear on a normal install. `catalogue` is
+re-applied to agents that already exist, not only to ones created later. A mode
+whose prerequisite is missing (`catalogue` with an empty `hiddenTools`) is shown
+greyed and explained rather than silently doing nothing.
 
 How it is wired, because it is the part that needed research:
 
 - The Client half is a lazy module registered through
-  `window.__ModuleLoader__.load`, whose id equals the package name, and it
-  mounts with `ctx.slots.inject` + `ctx.slots.register` into
-  `conversation.composer.dock`.
-- The two halves talk over **one exact HTTP route** (`bridge.path`). That is not
-  a preference: `host.call` exists only for sandboxed *dynamic packages*, and
-  the Client service catalog (`layout`, `locale`, `sessions`, `slots`, `theme`,
-  `timer`, `uiWorkspace`, `workspaces`) has no Host-facing call surface, so a
-  profile-installed bundle needs a carrier the page can reach. The shipped
-  market plugin solves it the same way.
-- Visible text follows the locale read from the Client `locale` service, and
-  every colour is a `--dsw-alias-*` theme token, so light and dark both read
-  correctly with no stylesheet.
+  `window.__ModuleLoader__.load`, whose id equals the package name. It mounts
+  with `ctx.slots.inject` + `ctx.slots.register` into
+  `conversation.composer.dock` for the panel and `settings.section` for the
+  statistics page, and declares `@deepseek-ai/dsh-client-runtime` and
+  `@deepseek-ai/dsh-client-ui-slots` in `dsh.client.inject` because the slots
+  package owns those targets.
+- The two halves talk over **exact HTTP routes** (`bridge.path` and its derived
+  `/stats` sibling). That is not a preference: `host.call` exists only for
+  sandboxed *dynamic packages*, and the Client service catalog (`layout`,
+  `locale`, `sessions`, `slots`, `theme`, `timer`, `uiWorkspace`, `workspaces`)
+  has no Host-facing call surface, so a profile-installed bundle needs a carrier
+  the page can reach. The shipped market plugin solves it the same way.
+- Visible text is pinned to Chinese by `PANEL_LOCALE` in `client.js`: the Client
+  `locale` service could not be read reliably from a profile-installed bundle,
+  so following it meant silently falling back to English. The English dictionary
+  stays in the same table, so switching back is a one-line change. Every colour
+  is a `--dsw-alias-*` theme token, so light and dark both read correctly with no
+  stylesheet.
+
+## The statistics page
+
+Settings → 省 Token 统计 reports what the savings actually did:
+
+```
+累计节省 Token（估算）
+5,120
+来自被移除的 20,480 个字符（仅统计压缩）
+
+  本次进程                历史累计
+  检查过的工具结果  42     检查过的工具结果  310
+  被重写的结果      35     被重写的结果      288
+  被截断的结果      12     被截断的结果      97
+  移除的字符数  12.0k / 40.0k      移除的字符数  88.0k / 240.0k
+  节省比例          30.0%          节省比例          36.7%
+
+按工具明细（本次进程）
+工具        Token     被重写   调用次数   节省比例
+read        3,000     3        3         100.0%
+pwsh        1,120     8        12        40.2%
+
+工具目录精简      2 tool(s) hidden · 每次请求约省 900 token
+记忆注入次数 1    记忆注入字符数 300    原文留存失败 0
+```
+
+- **Pricing.** The Host half keeps the counters and prices them with the same
+  heuristic the Harness uses to show context usage (4 characters ≈ 1 token), so
+  the figure is comparable with the context meter rather than a second,
+  incompatible estimate. It is a compression-only figure: it counts what the
+  transforms removed, not what the model would have sent anyway.
+- **Two scopes.** The current process and the all-time record are reported side
+  by side, because they answer different questions — "is this working right now"
+  and "was it worth installing". A two-step control clears only the all-time
+  half; the running process figures stay honest.
+- **The catalogue figure is per request**, not a total, and is printed that way:
+  while the restriction is active, every request the agent makes is missing those
+  schemas, so there is no single request to attribute it to.
+- The record is persisted beside the mode state
+  (`dsh-token-frugal.stats.json`), at most once every five seconds and once more
+  on shutdown, so a burst of tool calls writes once. When no profile could be
+  found the all-time half is kept in memory only and the page says so instead of
+  pretending the total is complete. `spillFailures` counts
+  results whose full text could not be stored: those are the cases where the trim
+  could not name a recovery path.
+- The page follows the record while it is open (a five-second refresh) and reads
+  it over the derived `/stats` route, which refuses any body other than
+  `{"reset": true}`.
 
 ## The workspace memory document
 
@@ -214,6 +285,7 @@ concatenating them.
 | No recovery path at all | **Elision is skipped.** Only the lossless transforms run. The plugin never drops text it cannot hand back. |
 | A failed call (`isError`) | The budget is multiplied by `errorBudgetFactor` (default 2): an error message is worth more than a success message of the same size. |
 | Anything throws inside the transform | The untouched decision is returned and a warning is logged. A compression fault can never turn a successful tool call into an error. |
+| A sibling `tools/post-execute` listener returns nothing | `next()` resolves `undefined`, which is a legal return for that hook. The hook restores the `kind` the pipeline requires — `{ kind: 'accept' }`, the same value the pipeline's own terminal returns — keeps every field the sibling did return, and passes that repaired decision outward, so one misbehaving listener cannot break this plugin or the listeners registered before it. |
 
 Setting `recovery: none` disables elision outright — the lossless floor is a
 measured **1.87%** prompt-token reduction with zero bytes dropped.
@@ -348,7 +420,8 @@ never sent in its larger form.
 | Check | Result |
 |---|---|
 | `node --test test/*.test.mjs` | 29 tests pass: transform invariants (never grow, idempotent, rich blocks preserved), patch ⇄ field-table ⇄ defaults agreement, config validation, policy decisions, multi-frame log decoding. |
-| `node test/load-check.mjs` | Passes: exports, both extension points driven through a fake context, fault isolation, unknown-field rejection, and the refuse-to-elide-without-recovery rule. |
+| `node test/load-check.mjs` | Passes, and now also drives the statistics route (GET reports the saving this run already made, POST `{"reset": true}` zeroes the all-time half and leaves the running process figures alone, a bad body is a 400, an unsupported method a 405) and really renders both Client surfaces with a stub React: the collapsed panel lists three grades and no switches, opening each grade in turn surfaces all nine modes exactly once, the mode state matches what the route reported, and the settings page renders its per-tool table. The check also asserts `client.js` holds no U+FFFD replacement character, because a lossy re-encode of that file once corrupted the panel silently. |
+| Live statistics | **Pending a Harness restart.** The Host half is read when the process starts, so a process still running 2.0.3 serves no statistics route at all — `GET /dsh-token-frugal/stats` answers **404**, which is exactly what the live probe returned. The route, its payload, the panel, and the settings page are all verified in-process by `load-check`; restarting the app is what turns them on. |
 | Live mount | **Verified.** `install_bundle` reports `application: applied` with no warnings; the row is live (`Config.listConfigs` → `patchId: token-frugal`, `status: absent` because the plugin declares no schema). |
 | Live elision and recovery | **Verified end to end.** A 400-line `pwsh` result was logged as 15 retained head lines, 11 tail lines, and a marker naming the truncation; the full 400-line original was found at the locator the marker named, written by `dsh-spill-local` through the shared `ctx.spillStore` service. |
 
@@ -374,11 +447,23 @@ unknown mode with 400 and an unsupported method with 405; and the Client half is
 imported with a fake module loader to assert its module id, its `slots`
 dependency, and the exact `conversation.composer.dock` registration.
 
-**A running Harness must be restarted once to load v2.** A profile-installed
-bundle is an ES module cached per process, so a disable/enable cycle keeps
-executing the previous code generation — `set_bundle` reports
+For 2.0.4 the same check goes further, because both new surfaces would otherwise
+be unverifiable until a live restart: the statistics route is driven end to end
+(and its GET must report the saving the check itself already produced, which
+proves the counters are wired to the transform pipeline rather than merely
+present), and both Client surfaces are really rendered with a stub React,
+including the assertion that opening each grade in turn surfaces all nine modes
+exactly once. The check reports `23843 chars saved across 2 tool(s)` for its own
+run.
+
+**A running Harness must be restarted once to load v2, and again for 2.0.4.** A
+profile-installed bundle is an ES module cached per process, so a disable/enable
+cycle keeps executing the previous code generation — `set_bundle` reports
 `unknown config field "modes"` from the cached copy until the process restarts.
-That is a property of the Harness, not of this plugin.
+That is a property of the Harness, not of this plugin. The Host half is what
+serves the statistics route, so until the restart `GET
+/dsh-token-frugal/stats` answers 404; the Client half is re-read per page load,
+so the panel and the settings page appear after a browser refresh.
 
 ```bash
 npm run verify                                  # syntax, unit tests, load check

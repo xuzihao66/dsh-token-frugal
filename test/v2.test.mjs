@@ -3,7 +3,7 @@
 // than they save, or from recording something the user did not say.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -96,7 +96,26 @@ test('a corrupt or stale state file is ignored rather than half-applied', () => 
 test('the state directory prefers the profile, then the harness home', () => {
   assert.equal(stateDirectory({ DSH_PROFILE_DIR: 'C:/p', DSH_HOME: 'C:/h' }), 'C:/p');
   assert.match(stateDirectory({ DSH_HOME: 'C:/h', DSH_PROFILE: 'desktop' }), /desktop$/);
-  assert.equal(stateDirectory({}), undefined, 'no directory means no persistence, not a crash');
+  assert.equal(stateDirectory({}, 'C:/nowhere'), undefined, 'no directory means no persistence, not a crash');
+});
+
+test('an unadvertised profile is discovered by evidence, never by guesswork', () => {
+  const root = mkdtempSync(join(tmpdir(), 'token-frugal-home-'));
+  try {
+    const profiles = join(root, 'profiles');
+    mkdirSync(join(profiles, 'desktop', 'node_modules', 'dsh-token-frugal'), { recursive: true });
+    mkdirSync(join(profiles, 'untouched'), { recursive: true });
+    assert.equal(stateDirectory({}, root), join(profiles, 'desktop'));
+    // A file this plugin wrote earlier is evidence too - but a second
+    // candidate turns the answer into "no directory" rather than a coin toss.
+    writeFileSync(
+      join(profiles, 'untouched', STATE_FILE),
+      JSON.stringify({ version: STATE_VERSION, modes: { elide: false } }),
+    );
+    assert.equal(stateDirectory({}, root), undefined, 'two candidates is ambiguity, not a choice');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------
