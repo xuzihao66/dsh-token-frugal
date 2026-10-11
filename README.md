@@ -194,6 +194,16 @@ Three rules keep it from costing more than it saves:
    the current turn are never quoted back, and the same extracts are never
    injected twice in a row.
 
+Each injection is a complete user message: its own id, `role: 'user'`, and a
+producer-owned `source.kind` of `token-frugal-recall`. That last field is not
+decoration — the Harness reads `message.source.kind` unguarded in three places
+(the webhook invariant over `agent/inbox/spliced`, `isOwned()` in the agent
+loop, and the Chat inbox filter), and `dsh-session` rejects a message without
+one. A source-less injection does not fail quietly: it blanks the page. The kind
+also tells the plugin which messages are its own — the carrier is claimed like
+any other pending input, so recall returns early on it instead of recording its
+own text into the memory document.
+
 The injected text names its source and says what to do with it:
 
 ```text

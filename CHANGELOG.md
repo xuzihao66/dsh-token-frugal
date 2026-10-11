@@ -1,5 +1,45 @@
 # Changelog
 
+## 2.0.5
+
+One fix, in the only place this plugin writes *into* the conversation rather than
+around it. Recall was crashing the page; it now carries the message source every
+durable message is required to have.
+
+**The recall injection had no `source`, and the Harness reads `source.kind`
+unguarded.** `agent.inject()` hands its message straight to the next-step inbox,
+and three separate readers dereference `message.source.kind` without checking
+that `source` exists at all: the `@deepseek-ai/dsh-webhook` relationship
+invariant over every `agent/inbox/spliced` event
+(`dsh-webhook/lib/invariant.js:14`), `isOwned()` in the agent loop over every
+`user/message` (`dsh-agent-loop/lib/index.js:221`), and — the one that blanks
+the window — the Chat inbox filter inside a React `useMemo`
+(`dsh-client-ui-chat/lib/client.js:5187`), which threw while rendering and took
+the whole tree down with it. `dsh-session` refuses the message outright as well
+(`${subject} message has invalid source`, `dsh-session/lib/index.js:1202`), and
+the session format requires a *producer-owned* kind. The injected message now
+carries `source: { kind: 'token-frugal-recall' }`.
+
+**The test now enforces that contract.** The fake agent in
+`test/load-check.mjs` accepted any object, which is exactly why a source-less
+message passed locally and failed in the app — the mock is now as strict as
+`dsh-session`, asserting a nonempty string `source.kind` on every injected
+message plus the exact kind value. Replaying the three unguarded reads against
+the message recorded in the crashed session's own log reproduces `TypeError:
+Cannot read properties of undefined (reading 'kind')` for 2.0.4 and passes for
+2.0.5.
+
+**The plugin no longer mistakes its own carrier for user input.** The kind is
+also what makes the injection addressable. `inject()` appends to the next-step
+inbox, and `Inbox.claim()` hands every claimed message — including that one —
+back through `agent/inbox/claimed` at the next step boundary. The recall handler
+ignored that fact, so a healthy turn would have recorded the whole
+`<recalled-context>` block into the memory document as though the human had
+typed it, and then matched recall against that copy. The handler now returns
+early on `source.kind === 'token-frugal-recall'`. `test/load-check.mjs` replays
+the claim and asserts that the carrier triggers no second injection and never
+reaches the memory document.
+
 ## 2.0.4
 
 Two changes: a statistics page that reports what was saved, and a panel whose copy

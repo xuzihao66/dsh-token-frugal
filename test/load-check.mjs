@@ -83,6 +83,7 @@ const injections = [];
 const warnings = [];
 const infos = [];
 const injected = [];
+const sourceViolations = [];
 
 const fire = (event, ...args) => {
   const handlers = listeners.get(event) ?? [];
@@ -94,7 +95,24 @@ const sessionId = 'session-load-1';
 const agent = {
   id: sessionId,
   session: { header: { id: sessionId, cwd: workspace } },
-  inject: (message) => { injected.push(message); },
+  // Mirror the durable-message contract `dsh-session` enforces on every
+  // appended message: a nonempty producer-owned `source.kind`. The mock used
+  // to accept anything, which is how 2.0.x shipped a source-less recall
+  // message that threw "Cannot read properties of undefined (reading 'kind')"
+  // in the Host (the `dsh-webhook` `agent/inbox/spliced` invariant) and in the
+  // Chat inbox filter, blanking the page. Failing loudly here keeps a
+  // source-less injection from reaching a release again.
+  inject: (message) => {
+    const source = message?.source;
+    const valid = typeof source === 'object' && source !== null
+      && typeof source.kind === 'string' && source.kind.length > 0;
+    // Recorded before throwing: the recall path catches a failed injection and
+    // continues with a warning, so the violation has to outlive the throw to be
+    // reported by the assertion that follows the recall.
+    if (!valid) sourceViolations.push(message);
+    assert.ok(valid, 'an injected message needs a nonempty string source.kind');
+    injected.push(message);
+  },
   ctx: { tools: { restrict: () => () => {} }, effect: (fn) => { fn(); return () => {}; } },
 };
 
@@ -220,14 +238,29 @@ fire('agent/inbox/claimed', {
   message: { content: [{ type: 'text', text: '重试策略在哪个文件里实现？超时参数怎么配？' }] },
   turn: 2,
 });
+assert.deepEqual(sourceViolations, [], 'an injected message was missing its producer-owned source.kind');
 assert.equal(injected.length, 1, `expected exactly one recall injection, got ${injected.length}`);
 assert.equal(injected[0].role, 'user');
 assert.equal(typeof injected[0].id, 'string');
+assert.equal(injected[0].source.kind, 'token-frugal-recall', 'the injected message must carry its producer-owned source kind');
 const recalled = injected[0].content[0].text;
 assert.match(recalled, /<recalled-context source=/);
 assert.match(recalled, /Prefer these over re-reading the transcript/);
 assert.match(recalled, /重试策略/);
 console.log(`recall injected ${recalled.length} chars for a matching follow-up`);
+
+// `inject()` appends to next-step, so the carrier is claimed like any other
+// pending input and comes back through `agent/inbox/claimed` at the next step
+// boundary. The producer kind is what lets the plugin recognise its own
+// message: without the guard, the recalled text would be written into the
+// memory document as user input and then matched against itself.
+fire('agent/inbox/claimed', { agent, message: injected[0], turn: 2 });
+assert.equal(injected.length, 1, 'the plugin must not recall against its own carrier');
+assert.ok(
+  !readFileSync(memoPath, 'utf8').includes('<recalled-context'),
+  'the injected text must never be recorded as user input',
+);
+console.log('the plugin ignores its own injected carrier instead of recording it');
 
 fire('agent/inbox/claimed', {
   agent,

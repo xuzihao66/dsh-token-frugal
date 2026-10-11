@@ -57,6 +57,20 @@ export const inject = ['tools'];
 
 /** The substring `dsh-spill-policy` always writes into its recovery notice. */
 const SPILL_NOTICE = 'Full formatted result stored at:';
+/**
+ * The producer-owned source kind every message this plugin appends carries.
+ *
+ * A durable message needs a nonempty `source.kind`: `dsh-session` rejects a
+ * source-less message (`${subject} message has invalid source`), and the
+ * Harness reads `message.source.kind` unguarded in several places — the
+ * `@deepseek-ai/dsh-webhook` invariant over every `agent/inbox/spliced`
+ * inserted message, `RuntimeContextProjection.isOwned`, and the Chat inbox
+ * filter `inbox['next-step'].filter((m) => m.source.kind === 'user')`. A
+ * source-less injected message therefore throws "Cannot read properties of
+ * undefined (reading 'kind')": the turn dies in the Host and the Chat tree
+ * throws while rendering, which blanks the page.
+ */
+const RECALL_SOURCE = 'token-frugal-recall';
 /** The path tag the `read` tool prefixes to a file's content. */
 const READ_PATH = /^<path>([\s\S]*?)<\/path>/;
 /** Largest memory document read back for matching, so a runaway file is bounded. */
@@ -664,9 +678,35 @@ export function apply(ctx, config) {
   // -------------------------------------------------------------------------
   // 3. agent/inbox/claimed — record the input, then recall matching context
   // -------------------------------------------------------------------------
+  /**
+   * Build the user-role message recall appends to the inbox.
+   *
+   * `source.kind` is not decoration: `agent.inject()` hands the object straight
+   * to `inbox.splice()` → `agent/inbox/spliced`, and everything downstream
+   * reads `.source.kind` without a guard (see `RECALL_SOURCE`). Building the
+   * message by hand is what keeps the plugin import-free of `@deepseek-ai/*`,
+   * so the carrier shape has to be reproduced exactly: identity, role, text
+   * content, and a producer-owned source.
+   * @param text - the rendered recall block.
+   * @returns a complete user message for `agent.inject()`.
+   */
+  const recallMessage = (text) => ({
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: RECALL_SOURCE },
+  });
+
   ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
     const entry = sessions.get(agent?.id);
     if (entry === undefined) return;
+    // The recall carrier comes back through this same event: `inject()` appends
+    // to next-step, and `Inbox.claim()` hands every claimed message to
+    // `agent/inbox/claimed` — including ours, at the next step boundary. The
+    // producer kind is what recognises it. Without this guard the recalled text
+    // is recorded into the memory document as if the human had asked for it,
+    // and recall then matches that recorded copy — recalling the recall.
+    if (message?.source?.kind === RECALL_SOURCE) return;
     const text = textOfMessage(message);
     if (text.trim() === '') return;
     entry.turn = turn;
@@ -701,7 +741,7 @@ export function apply(ctx, config) {
       entry.injected.add(key);
       // Append-only: an `agent/inbox/spliced` event the model sees next step, so
       // the request prefix stays intact for the provider's cache.
-      agent.inject?.({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: rendered }] });
+      agent.inject?.(recallMessage(rendered));
       recordRecall(session, rendered.length);
       recordRecall(cumulative, rendered.length);
       scheduleFlush();
