@@ -1,4 +1,6 @@
-
+v2.0.5修复了v2.0.3的source.kind为空导致dsh显示异常的问题
+v2.0.3将对话框下方的页面进行了分组，使得页面看起来更加合理
+v2.0.2在设置页面新增了节省token的页面
 # dsh-token-frugal
 
 Cut the input-token cost of a long DeepSeek Harness session without taking any
