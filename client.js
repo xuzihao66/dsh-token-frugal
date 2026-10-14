@@ -55,6 +55,10 @@ window.__ModuleLoader__.load({
         savedTo: 'settings in',
         notSaved: 'not saved (no config folder found)',
         failed: 'Could not reach the plugin',
+        depthTitle: 'Elision depth',
+        depthHint: 'cut measured at source',
+        depthNote: (value) => `−${value}% prompt`,
+        depths: { standard: 'Standard', deep: 'Deep', extreme: 'Extreme' },
         statsHint: 'Full saving report: Settings → Token savings',
         tiers: {
           basic: ['Basic', 'Removes whitespace and control codes only; no semantic content changes'],
@@ -83,6 +87,7 @@ window.__ModuleLoader__.load({
           calls: 'Tool results inspected',
           rewritten: 'Results rewritten',
           elided: 'Results trimmed',
+    aged: 'Aged digests',
           saved: 'Characters removed',
           tokens: 'Tokens saved',
           ratio: 'Saved share',
@@ -116,6 +121,10 @@ window.__ModuleLoader__.load({
         savedTo: '设置文件',
         notSaved: '未写入磁盘（未找到配置目录）',
         failed: '无法连接插件',
+        depthTitle: '截断深度',
+        depthHint: '源头截断强度',
+        depthNote: (value) => `提示词 −${value}%`,
+        depths: { standard: '标准', deep: '深度', extreme: '极限' },
         statsHint: '完整节省统计：设置 → 省 Token 统计',
         tiers: {
           basic: ['初等', '只清理空白与控制符，不改变任何语义内容'],
@@ -144,6 +153,7 @@ window.__ModuleLoader__.load({
           calls: '检查过的工具结果',
           rewritten: '被重写的结果',
           elided: '被截断的结果',
+    aged: '时效替换',
           saved: '移除的字符数',
           tokens: '节省的 Token',
           ratio: '节省比例',
@@ -275,8 +285,66 @@ window.__ModuleLoader__.load({
     }
 
     /** One grade: a header row that opens its modes, closed by default. */
+/**
+ * The Advanced grade’s elision depth: one budget table per tier.
+ *
+ * These three are a radio group rather than three switches, because a
+ * profile sits on exactly one tier and the host refuses a depth it does not
+ * know. The percentage is the measured prompt reduction over this workspace’s
+ * recorded sessions — an estimate of the tier, not a promise for a session.
+ */
+function DepthPicker(props) {
+ const { current, options, onPick, busy, text } = props;
+ const list = Array.isArray(options) ? options : [];
+ if (list.length === 0) return null;
+ return h('div', {
+ style: {
+ display: 'flex', flexDirection: 'column', gap: '5px',
+ marginTop: '2px', padding: '7px 9px', borderRadius: '8px',
+ border: '1px solid var(--dsw-alias-border-l1)',
+ background: 'var(--dsw-alias-bg-layer-1)',
+ },
+ },
+ h('div', {
+ style: { display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '8px' },
+ },
+ h('span', { style: { fontSize: '11px', fontWeight: 600 } }, text.depthTitle),
+ h('span', {
+ style: { fontSize: '10px', color: 'var(--dsw-alias-label-secondary)' },
+ }, text.depthHint),
+ ),
+ h('div', { style: { display: 'flex', gap: '6px', flexWrap: 'wrap' } },
+ list.map((depth) => {
+ const on = depth.id === current;
+ const [label] = text.depths[depth.id] ?? [depth.id];
+ return h('button', {
+ key: depth.id,
+ type: 'button',
+ role: 'radio',
+ 'aria-checked': on ? 'true' : 'false',
+ 'data-depth': depth.id,
+ disabled: busy || on,
+ onClick: () => onPick(depth.id),
+ title: text.depthNote(depth.promptReductionPercent),
+ style: {
+ display: 'inline-flex', alignItems: 'center', gap: '5px',
+ padding: '3px 9px', borderRadius: '999px',
+ border: '1px solid ' + (on ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-border-l1)'),
+ background: on ? 'var(--dsw-alias-bg-layer-2)' : 'transparent',
+ color: on ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)',
+ fontSize: '11px', lineHeight: '16px', font: 'inherit',
+ cursor: disabled ? 'default' : 'pointer',
+ },
+ }, h('span', null, label),
+ h('span', { style: { fontSize: '10px', opacity: 0.75 } }, text.depthNote(depth.promptReductionPercent)),
+ );
+ }),
+ ),
+ );
+}
+
     function TierBlock(props) {
-      const { tier, open, onToggle, onSetAll, modes, text, busy, onToggleMode } = props;
+      const { tier, open, onToggle, onSetAll, modes, text, busy, onToggleMode, depth } = props;
       const [label, note] = text.tiers[tier.id] ?? [tier.id, ''];
       const rows = tier.modes.map((id) => modes.find((mode) => mode.id === id)).filter(Boolean);
       const usable = rows.filter((mode) => mode.available !== false);
@@ -338,7 +406,8 @@ window.__ModuleLoader__.load({
       rows.map((mode) => h(ModeRow, {
         key: mode.id, id: mode.id, on: mode.on, available: mode.available,
         text, busy, onToggle: onToggleMode,
-      })),
+})),
+            depth ? h(DepthPicker, depth) : null,
       ) : null,
       );
     }
@@ -373,17 +442,18 @@ window.__ModuleLoader__.load({
        * Send one mode patch and adopt the host's answer. The panel answers
        * immediately and reverts every optimistic cell on failure.
        */
-      const commit = async (patch) => {
+      const commit = async (patch, depth) => {
         const previous = state;
         setState((current) => current === null ? current : {
           ...current,
           modes: current.modes.map((mode) => (Object.hasOwn(patch, mode.id) ? { ...mode, on: patch[mode.id] } : mode)),
+          elisionDepth: depth === undefined ? current.elisionDepth : depth,
         });
         try {
           const response = await fetch(ENDPOINT, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ modes: patch }),
+            body: JSON.stringify(depth === undefined ? { modes: patch } : { modes: patch, depth }),
           });
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           setState(await response.json());
@@ -403,6 +473,19 @@ window.__ModuleLoader__.load({
         }
       };
 
+/**
+ * Move the elision tier. A tier is a budget table, not a switch: the host
+ * answers with the state it actually holds, so the panel never guesses.
+ */
+const setDepth = async (id) => {
+      setBusy('depth');
+      try {
+       await commit({}, id);
+      } finally {
+       setBusy('');
+      }
+};
+
       const setTierAll = async (definition, next) => {
         const current = state?.modes ?? [];
         const ids = definition.modes.filter((id) => current.some((mode) => mode.id === id && mode.available !== false));
@@ -418,6 +501,13 @@ window.__ModuleLoader__.load({
       const modes = state?.modes?.filter((mode) => mode.available !== false) ?? [];
       const onCount = (state?.modes ?? []).filter((mode) => mode.on && mode.available !== false).length;
       const totalCount = modes.length;
+      const depthProps = {
+       current: state?.elisionDepth ?? '',
+       options: state?.depths ?? [],
+       onPick: setDepth,
+       busy: busy === 'depth',
+       text,
+      };
 
       return h('div', {
         style: {
@@ -485,6 +575,7 @@ window.__ModuleLoader__.load({
         style: { display: 'flex', flexDirection: 'column', gap: '6px' },
       }, TIERS.map((definition) => h(TierBlock, {
         key: definition.id,
+        depth: definition.id === 'advanced' ? depthProps : undefined,
         tier: definition,
         open: tier === definition.id,
         onToggle: (id) => setTier((current) => (current === id ? '' : id)),
@@ -593,6 +684,7 @@ window.__ModuleLoader__.load({
       h(Line, { label: text.calls, value: compact(summary.calls) }),
       h(Line, { label: text.rewritten, value: compact(summary.rewritten) }),
       h(Line, { label: text.elided, value: compact(summary.elided) }),
+        h(Line, { label: text.aged, value: compact(summary.aged ?? 0) }),
       h(Line, { label: text.saved, value: `${compact(summary.savedChars)} / ${compact(summary.before)}` }),
       h(Line, { label: text.ratio, value: percent(summary.savedRatio), accent: true }),
       h(Bar, { ratio: summary.savedRatio }),
@@ -754,6 +846,7 @@ window.__ModuleLoader__.load({
         h(Line, { label: stats.recall, value: compact(cumulative?.recallInjections ?? 0) }),
         h(Line, { label: stats.recallChars, value: compact(cumulative?.recallChars ?? 0) }),
         h(Line, { label: stats.spillFailures, value: compact(cumulative?.spillFailures ?? 0) }),
+        h(Line, { label: stats.aged, value: compact(cumulative?.aged ?? 0) }),
         ),
       ),
       h(Card, null,

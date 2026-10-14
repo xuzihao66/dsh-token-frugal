@@ -28,6 +28,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { depthFor } from '../lib/depths.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..');
@@ -94,7 +95,20 @@ const fire = (event, ...args) => {
 const sessionId = 'session-load-1';
 const agent = {
   id: sessionId,
-  session: { header: { id: sessionId, cwd: workspace } },
+  session: {
+    id: sessionId,
+    header: { id: sessionId, cwd: workspace },
+    // A session the plugin may rewrite: `append` records what the Host would
+    // record, `eventAt` reads it back, and the aging test asserts the surface
+    // replacement lands on the original seq.
+    events: [],
+    append(type, data, opts) {
+      const event = { type, seq: this.events.length, time: Date.now(), data, ...(opts ?? {}) };
+      this.events.push(event);
+      return event;
+    },
+    eventAt(seq) { return this.events[seq]; },
+  },
   // Mirror the durable-message contract `dsh-session` enforces on every
   // appended message: a nonempty producer-owned `source.kind`. The mock used
   // to accept anything, which is how 2.0.x shipped a source-less recall
@@ -306,7 +320,7 @@ assert.deepEqual(postResponse.json.changed, { json: false, terminal: false });
 const statePath = join(workspace, 'dsh-token-frugal.state.json');
 assert.ok(existsSync(statePath), `the choice must be persisted at ${statePath}`);
 assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf8')).modes.json, false);
-assert.ok(infos.some((line) => line.includes('modes changed via panel')));
+assert.ok(infos.some((line) => line.includes('panel change')), 'the change must be logged');
 
 const afterToggle = exchange();
 await route.handler({ method: 'GET' }, afterToggle);
@@ -324,6 +338,49 @@ const methodResponse = exchange();
 await route.handler({ method: 'DELETE' }, methodResponse);
 assert.equal(methodResponse.state.status, 405);
 console.log('an unknown mode is rejected, and an unsupported method gets 405');
+
+// ---------------------------------------------------------------------------
+// the elision depth
+// ---------------------------------------------------------------------------
+// The depth is a budget table, not a switch, so it travels in the same body
+// under its own key: `{"modes":{...},"depth":"extreme"}`. An unknown tier must
+// be a 400 — silently falling back would let the panel claim a tier the host
+// never applied.
+assert.deepEqual(afterToggle.json.depths.map((depth) => depth.id), ['standard', 'deep', 'extreme']);
+assert.equal(afterToggle.json.elisionDepth, 'standard', 'a profile with no stored tier is on the default');
+assert.ok(afterToggle.json.depths.every((depth) => typeof depth.promptReductionPercent === 'number'));
+assert.ok(afterToggle.json.depths.every((depth) => Number.isFinite(depth.defaultMaxChars)));
+
+const depthResponse = exchange();
+await route.handler({
+  method: 'POST',
+  async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ modes: {}, depth: 'extreme' })); },
+}, depthResponse);
+assert.equal(depthResponse.state.status, 200, 'a depth-only change must be accepted');
+assert.equal(depthResponse.json.changed.json, undefined, 'a depth change is not a mode change');
+assert.equal(depthResponse.json.elisionDepth, 'extreme');
+assert.equal(depthResponse.json.previousDepth, 'standard');
+assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).elisionDepth, 'extreme', 'the tier must be persisted too');
+console.log('POST {depth} moved the tier, persisted it, and reported the previous one');
+
+const unknownDepth = exchange();
+await route.handler({
+  method: 'POST',
+  async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ depth: 'deeper' })); },
+}, unknownDepth);
+assert.equal(unknownDepth.state.status, 400, 'an unknown depth must be a 400, not a silent fallback');
+
+const emptyBody = exchange();
+await route.handler({
+  method: 'POST',
+  async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({})); },
+}, emptyBody);
+assert.equal(emptyBody.state.status, 400, 'an empty patch is not a change');
+
+const afterDepth = exchange();
+await route.handler({ method: 'GET' }, afterDepth);
+assert.equal(afterDepth.json.elisionDepth, 'extreme', 'GET must report the tier the profile is on');
+console.log('an unknown depth and an empty body are both rejected');
 
 // ---------------------------------------------------------------------------
 // the statistics route
@@ -373,6 +430,69 @@ const statsMethod = exchange();
 await statsRoute.handler({ method: 'PUT' }, statsMethod);
 assert.equal(statsMethod.state.status, 405);
 console.log('the statistics route reports, clears the all-time half, and refuses bad input');
+
+// ---------------------------------------------------------------------------
+// aging: a result that is no longer new is rebuilt as a digest
+// ---------------------------------------------------------------------------
+// `agent/pre-step` is where the rewrite is committed, so the digest lands
+// before the request built from that step and the shorter history is what the
+// model reads. The original event stays in the transcript, which is why this
+// is a surface replacement and not another `tools/post-execute` decision.
+const extremeTier = exchange();
+await route.handler({
+  method: 'POST',
+  async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ modes: {}, depth: 'extreme' })); },
+}, extremeTier);
+assert.equal(extremeTier.state.status, 200, 'the aging test needs the extreme tier');
+assert.equal(extremeTier.json.elisionDepth, 'extreme');
+
+const sessionLog = agent.session;
+const body = Array.from({ length: 60 }, (_, i) => `line ${i + 1}: ${((i + 1) * 2654435761 % 4294967296).toString(16).padStart(8, '0').repeat(6)}`).join('\n');
+const resultSeqs = [];
+for (let i = 0; i < 7; i += 1) {
+  const call = sessionLog.append('tool/call', { turn: 1, step: i, callId: `c${i}`, name: 'read', arguments: '{}' }, { surfaceOp: 'append' });
+  fire('session/event', sessionLog, call);
+  const result = sessionLog.append('tool/result', {
+    turn: 1,
+    step: i,
+    message: { toolCallId: `c${i}`, content: [{ type: 'text', text: body }] },
+  }, { surfaceOp: 'append' });
+  fire('session/event', sessionLog, result);
+  resultSeqs.push(result.seq);
+}
+
+const beforeAging = sessionLog.events.length;
+const preStep = (listeners.get('agent/pre-step') ?? [])[0];
+assert.ok(typeof preStep === 'function', 'the aging path must listen on agent/pre-step');
+const enter = async () => ({ kind: 'enter', messages: [] });
+await preStep({ agent }, enter);
+
+const appended = sessionLog.events.slice(beforeAging);
+const extremity = depthFor('extreme').aging.keepFull;
+assert.equal(appended.length, resultSeqs.length - extremity, `the extreme tier keeps ${extremity} result(s) whole and ages the rest`);
+for (const [index, event] of appended.entries()) {
+  const target = resultSeqs[index];
+  assert.equal(event.type, 'tool/result');
+  assert.deepEqual(event.surfaceOp, { op: 'replace', startSeq: target, endSeq: target });
+  assert.deepEqual(event.sourceEventSeqs, [target], 'a replacement must cite every node it shadows');
+  const text = event.data.message.content.map((block) => block.text).join('');
+  assert.ok(text.length < body.length, 'the aged copy must be shorter');
+  assert.match(text, /elided by dsh-token-frugal/);
+  // `dsh-session` permits exactly this much and no more.
+  const rest = (value) => ({ ...value, message: { ...value.message, content: null } });
+  assert.deepEqual(rest(event.data), rest(sessionLog.eventAt(target).data));
+}
+assert.equal(sessionLog.eventAt(resultSeqs[0]).data.message.content[0].text, body, 'the transcript keeps the full text');
+
+const afterAging = sessionLog.events.length;
+await preStep({ agent }, enter);
+assert.equal(sessionLog.events.length, afterAging, 'a result is aged once, never again');
+
+const agingReport = exchange();
+await statsRoute.handler({ method: 'GET' }, agingReport);
+assert.equal(agingReport.json.session.aged, resultSeqs.length - extremity, 'the aged results are reported');
+console.log(`aging: ${appended.length} of ${resultSeqs.length} results replaced by digests, transcript intact`);
+
 
 // ---------------------------------------------------------------------------
 // the Client half

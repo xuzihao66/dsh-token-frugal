@@ -31,9 +31,10 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { homedir } from 'node:os';
 import zlib from 'node:zlib';
-import { compressText, compressContent, compressContentToBudget } from '../lib/compress.js';
+import { agingRecoveryHint, compressText, compressContent, compressContentToBudget } from '../lib/compress.js';
 import { estimateMessage, estimateToolsTokens, contentChars } from '../lib/estimate.js';
 import { DEFAULT_CONFIG } from '../lib/defaults.js';
+import { depthFor, sanitizeDepth, ELISION_DEPTH_IDS } from '../lib/depths.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SURFACE = new Set(['system/message', 'developer/message', 'user/message', 'assistant/message', 'tool/result']);
@@ -51,9 +52,14 @@ const USAGE = `Measure the token effect of dsh-token-frugal on recorded sessions
   --config <path>       read the policy from a JSON file
   --budgets <a:1,b:2>   override per-tool character budgets
   --default-max-chars <n>
+  --depth <standard|deep|extreme> the panel's elision tier; --budgets wins over it
   --no-elide            lossless transforms only; nothing is ever dropped
   --only <tool>         restrict the per-tool table
   --compare-placement   also model rewriting history late instead of at source
+  --aging model the tier's age-driven digests and the re-prefill they cost
+  --no-aging price every result at arrival, as if nothing ever aged
+  --aging-keep <n>      how many newest results stay whole when aging
+  --aging-limit <n>     the digest budget an aged result is held to
   --include-live        include the session that is still being written
   --quiet               suppress the stdout summary
 
@@ -224,7 +230,7 @@ function resolvePolicy(options) {
   const apply = (from, label) => {
     for (const [key, value] of Object.entries(from)) {
       if (!(key in policy)) {
-        throw new Error(`token-frugal: ${label} sets unknown key "${key}"; refusing to measure a policy the plugin would reject`);
+        throw new Error(`${label} sets unknown key "${key}"; refusing to measure a policy the plugin would reject`);
       }
       if (key === 'toolBudgets' || key === 'transforms') Object.assign(policy[key], value);
       else policy[key] = value;
@@ -238,6 +244,26 @@ function resolvePolicy(options) {
   }
   if (typeof options.config === 'string') {
     apply(JSON.parse(readFileSync(options.config, 'utf8')), options.config);
+  }
+  if (typeof options.depth === 'string') {
+    if (sanitizeDepth(options.depth) === undefined) {
+      throw new Error(`unknown --depth "${options.depth}"; the panel offers ${ELISION_DEPTH_IDS.join(', ')}`);
+    }
+    const depth = depthFor(options.depth);
+    if (depth.defaultMaxChars !== undefined) policy.defaultMaxChars = depth.defaultMaxChars;
+    Object.assign(policy.toolBudgets, depth.budgets);
+    // The tier's aging rule rides along with its budgets; a caller can still
+    // price the same tier with arrival-only placement by passing --no-aging.
+    if (depth.aging !== undefined && options.aging !== false) policy.aging = depth.aging;
+    // An explicit override lets the constants be searched rather than assumed.
+    if (Number.isSafeInteger(options.agingKeep) || Number.isSafeInteger(options.agingLimit)) {
+    policy.aging = {
+    keepFull: options.agingKeep ?? policy.aging?.keepFull ?? 3,
+    lateLimit: options.agingLimit ?? policy.aging?.lateLimit ?? 600,
+    };
+    source = `${source} + --aging-keep ${policy.aging.keepFull} --aging-limit ${policy.aging.lateLimit}`;
+    }
+    source = `${source} + --depth ${depth.id}`;
   }
   if (typeof options.budgets === 'string') {
     for (const pair of options.budgets.split(',')) {
@@ -348,6 +374,22 @@ function messageOf(event) {
   return event.data?.message;
 }
 
+/**
+ * The digest the tier would leave in place of an aged result: the same
+ * content rules as arrival compression, but bounded by the late limit.
+ * @returns the replacement message, or null when nothing would shrink.
+ */
+function digestOf(policy, full, name) {
+const content = full.content ?? [];
+const hint = policy.recovery === 'none' || name === undefined
+      ? recoveryHint(policy, 'unknown', textOf(content))
+      : agingRecoveryHint(name, textOf(content), policy.readSourceRecovery);
+if (hint === undefined) return null;
+const bounded = compressContentToBudget(content, policy.aging.lateLimit, { ...compressOptions(policy), recoveryHint: hint });
+if (bounded === undefined || bounded.after >= bounded.before) return null;
+return { ...full, content: bounded.blocks };
+}
+
 /** Common prefix length of two arrays. */
 function sharedPrefix(previous, current) {
   let i = 0;
@@ -396,7 +438,15 @@ function replay(events, policy) {
     }
     if (event.type !== 'step/start') continue;
 
-    const seqs = [];
+        // The newest results stay whole; the tier's aging rule replaces the rest.
+    const newest = new Set();
+    if (policy.aging !== undefined) {
+    const results = nodes.filter((node) => node.type === 'tool/result').map((node) => node.seq);
+    for (const seq of results.slice(-policy.aging.keepFull)) newest.add(seq);
+    }
+    let agedFrom = -1;
+    let agedCount = 0;
+const seqs = [];
     const baselinePrices = [];
     const optimizedPrices = [];
     for (const node of nodes) {
@@ -404,10 +454,10 @@ function replay(events, policy) {
       if (original === undefined) continue;
       let optimized = original;
       if (node.type === 'tool/result') {
-        let entry = applied.get(node.seq);
+        const name = callNames.get(original.toolCallId) ?? 'unknown';
+    let entry = applied.get(node.seq);
         if (entry === undefined) {
-          const name = callNames.get(original.toolCallId) ?? 'unknown';
-          const content = original.content ?? [];
+              const content = original.content ?? [];
           const result = applyPolicy(policy, name, content, original.isError === true);
           const stat = toolStats.get(name) ?? { results: 0, elided: 0, beforeChars: 0, afterChars: 0, beforeTokens: 0, afterTokens: 0 };
           stat.results += 1;
@@ -422,12 +472,26 @@ function replay(events, policy) {
           applied.set(node.seq, entry);
         }
         optimized = entry.optimized;
+        if (policy.aging !== undefined && node.type === 'tool/result' && !newest.has(node.seq)) {
+        if (entry.digest === undefined) entry.digest = digestOf(policy, entry.optimized, name);
+        if (entry.digest !== null) {
+        optimized = entry.digest;
+        if (entry.aged !== true) {
+        entry.aged = true;
+        agedCount += 1;
+        if (agedFrom === -1) agedFrom = optimizedPrices.length;
+        }
+        }
+        }
       }
       seqs.push(node.seq);
       baselinePrices.push(estimateMessage(original));
       optimizedPrices.push(estimateMessage(optimized));
     }
-    const baseline = baselinePrices.reduce((a, b) => a + b, 0);
+        // A digest that lands mid-history invalidates the provider cache from its
+    // own position on: that one request re-prefills the tokens after it.
+    const recache = agedFrom === -1 ? 0 : optimizedPrices.slice(agedFrom).reduce((a, b) => a + b, 0);
+const baseline = baselinePrices.reduce((a, b) => a + b, 0);
     const optimized = optimizedPrices.reduce((a, b) => a + b, 0);
     const toolTokens = estimateToolsTokens(tools);
     const previous = requests.at(-1);
@@ -442,6 +506,8 @@ function replay(events, policy) {
       optimizedEligible = toolReuse + previous.optimizedPrices.slice(0, shared).reduce((a, b) => a + b, 0);
     }
     requests.push({
+    recache,
+    aged: agedCount,
       seqs,
       baselinePrices,
       optimizedPrices,
@@ -471,6 +537,8 @@ function accumulate(report, path, result, options) {
     baselineEligible: 0,
     optimizedEligible: 0,
     lateEligible: 0,
+    agingRecache: 0,
+    agingReplacements: 0,
     toolEnvelopeChanges: 0,
     observed: { attempts: 0, inputTokens: 0, cacheReadTokens: 0, outputTokens: 0 },
   };
@@ -481,6 +549,8 @@ function accumulate(report, path, result, options) {
     session.baselineEligible += Math.min(request.baselineEligible, request.baseline + request.toolTokens);
     session.optimizedEligible += Math.min(request.optimizedEligible, request.optimized + request.toolTokens);
     if (request.toolsChanged) session.toolEnvelopeChanges += 1;
+    session.agingRecache += request.recache ?? 0;
+    session.agingReplacements += request.aged ?? 0;
     if (options.comparePlacement) {
       // Model the alternative placement: the same reduction delivered by
       // rewriting history once, late. That single rewrite destroys the prefix
@@ -530,9 +600,14 @@ function parseArgs(list) {
     else if (arg === '--config') options.config = list[++i];
     else if (arg === '--budgets') options.budgets = list[++i];
     else if (arg === '--default-max-chars') options.defaultMaxChars = Number(list[++i]);
+    else if (arg === '--depth') options.depth = list[++i];
     else if (arg === '--no-elide') options.elide = false;
     else if (arg === '--only') options.only = list[++i];
     else if (arg === '--compare-placement') options.comparePlacement = true;
+    else if (arg === '--aging') options.aging = true;
+    else if (arg === '--no-aging') options.aging = false;
+    else if (arg === '--aging-keep') options.agingKeep = Number(list[++i]);
+    else if (arg === '--aging-limit') options.agingLimit = Number(list[++i]);
     else if (arg === '--include-live') options.includeLive = true;
     else if (arg === '--quiet') options.quiet = true;
     else if (arg === '--help' || arg === '-h') options.help = true;
@@ -579,6 +654,8 @@ function main(options) {
     optimizedEligible: sum('optimizedEligible'),
     lateEligible: sum('lateEligible'),
     toolEnvelopeChanges: sum('toolEnvelopeChanges'),
+    agingRecache: sum('agingRecache'),
+    agingReplacements: sum('agingReplacements'),
   };
   const pct = (before, after) => (before === 0 ? 0 : (1 - after / before) * 100);
   const reduction = pct(totals.baselineTokens, totals.optimizedTokens);
@@ -596,6 +673,11 @@ function main(options) {
     toolCharsAfter: toolChars.after,
     toolCharReductionPercent: Number(pct(toolChars.before, toolChars.after).toFixed(2)),
     reductionPercent: Number(reduction.toFixed(2)),
+    // The prompt tokens actually served once the tier's digests land: an aged
+    // result shrinks every later request, and the one request that lands it
+    // re-prefills everything after it.
+    agingTokens: totals.optimizedTokens + totals.agingRecache,
+    agingReductionPercent: Number(pct(totals.baselineTokens, totals.optimizedTokens + totals.agingRecache).toFixed(2)),
     cacheHitRateBefore: totals.baselineTokens === 0 ? 0 : Number(((totals.baselineEligible / totals.baselineTokens) * 100).toFixed(2)),
     cacheHitRateAfter: totals.optimizedTokens === 0 ? 0 : Number(((totals.optimizedEligible / totals.optimizedTokens) * 100).toFixed(2)),
     observed: { attempts: observedAttempts, inputTokens: observedInput, cacheReadTokens: observedCache, cacheHitRate: Number(observedRate.toFixed(2)) },
@@ -644,6 +726,11 @@ function main(options) {
   push(`  uncached (miss)   ${String(totals.baselineTokens - totals.baselineEligible).padStart(10)} -> ${String(totals.optimizedTokens - totals.optimizedEligible).padStart(10)}  ${pct(totals.baselineTokens - totals.baselineEligible, totals.optimizedTokens - totals.optimizedEligible).toFixed(2)}%`);
   push(`  cache hit rate    ${report.totals.cacheHitRateBefore.toFixed(2)}% -> ${report.totals.cacheHitRateAfter.toFixed(2)}%   (cache-eligible share of the prompt)`);
   push(`  tool envelope     changed ${totals.toolEnvelopeChanges} time(s) during the replay`);
+  if (policy.aging !== undefined) {
+    const aged = totals.baselineTokens === 0 ? 0 : (1 - (totals.optimizedTokens + totals.agingRecache) / totals.baselineTokens) * 100;
+    push(`  aged digests ${totals.agingReplacements} result(s) replaced; the re-prefill costs ${totals.agingRecache} prompt tokens, once per replacement`);
+    push(`  prompt tokens with re-prefill ${String(totals.optimizedTokens + totals.agingRecache).padStart(10)}  ${aged.toFixed(1)}% saved`);
+  }
   if (options.comparePlacement) {
     const late = totals.baselineTokens === 0 ? 0 : (totals.lateEligible / totals.baselineTokens) * 100;
     const rewriteTokens = report.sessions.reduce((a, s) => a + (s.lateRewriteTokens ?? 0), 0);

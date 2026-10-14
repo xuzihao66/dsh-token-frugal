@@ -1,5 +1,86 @@
 # Changelog
 
+
+## 2.2.0
+
+**A result that stopped being new is now re-sent as a digest of itself.**
+
+The deeper tiers used to cut only at arrival: the budget a tool result was handed
+when it came back was the budget it kept for the rest of the session. In a long
+session that is the wrong shape — the newest results are the ones a model still
+reasons from, the older ones are context it rarely returns to. On the deep and
+extreme tiers, a result that has fallen out of the newest two (or the newest one)
+is now replaced, for the model only, by a head-and-tail digest carrying the same
+recovery hint an arrival-time elision carries.
+
+| Tier | Kept whole | Older results | Billed prompt tokens removed |
+|---|---|---|---|
+| 标准 `standard` | every result | untouched | 21.8% |
+| 深度 `deep` | newest 2 | 300-character digest | 29.5% |
+| 极限 `extreme` | newest 1 | 200-character digest | 32.1% |
+
+- **Nothing is lost.** The replacement is a `surfaceOp: replace` over the original
+  `tool/result` node, which `dsh-session` restricts to exactly that: the durable
+  log, the transcript, the memory document and the statistics keep the original
+  text. Only the request the model reads is shorter — and it is committed on
+  `agent/pre-step`, before the step that reads it.
+- **The constants are measured.** `tools/measure-tokens.mjs` now models aging the
+  way the provider bills it: every digest lands in old history, so it invalidates
+  the cached prefix from that point on. That re-prefill cost is why the shipped
+  rule keeps as much whole as it does and why the digest is short — `keepFull` at
+  three or more is a net loss, and the first cut at this feature (newest 3 whole,
+  600-character digests) priced at 25.5%, worse than no aging at all.
+- **A budget that cannot carry its marker no longer elides.** A marker cut off
+  mid-sentence reads as damage rather than as a pointer back, so `elideToBudget`
+  now refuses a budget below its own marker instead of emitting a truncated one.
+- **New measurement flags:** `--aging-keep`, `--aging-limit`, `--no-aging`, and
+  a `--depth` that now prices the shipped aging rule.
+- **New counters:** the stats page's 时效替换 / *Aged digests* row counts digests
+  separately from arrival rewrites, per process and cumulative.
+
+## 2.1.0
+
+One new control, on the grade that already asked for a deliberate choice. The 高等
+grade now carries the **elision depth**: three budget tables for how hard a long
+tool result is cut, measured end to end rather than asserted.
+
+**The biggest lever this plugin has was a constant, and is now a choice.** A tool
+result is re-sent on every later request in its session, so one character removed
+at the source is worth roughly 250 characters of prompt — which is why the
+per-tool character budget dominates everything else. The panel exposes three
+tiers of that table, all priced with `tools/measure-tokens.mjs` over one corpus
+(1946 requests across the 13 replayed sessions, modes at their shipped defaults):
+
+| Tier | Tool-result characters removed | Prompt tokens removed |
+|---|---|---|
+| 标准 `standard` | 46.9% | 22.0% |
+| 深度 `deep` | 63.3% | 27.6% |
+| 极限 `extreme` | 77.0% | 31.9% |
+
+`standard` is what earlier versions always did, and is still the default: a
+profile that never opens the selector behaves exactly as before. `deep` and
+`extreme` override `defaultMaxChars` and the budgets of the tools that produce
+the bulk of the context (`read`, `web_fetch`, `web_search`, `pwsh`, `bash`,
+`grep`, `glob`). Those entries override the configured table rather than
+replacing it, so a tool the tier does not name keeps the number the profile gave
+it, and `standard` is the profile's own table unchanged.
+
+**A tier is a budget table, not a switch, and the host is the only authority on
+it.** The bridge accepts `{"modes":{...},"depth":"extreme"}`; an unknown tier is
+refused with a 400 rather than silently falling back to one the panel did not ask
+for, and the response carries the tier the host actually applied together with
+the previous one. The choice is persisted as `elisionDepth` beside the modes in
+`dsh-token-frugal.state.json` (state schema 2). A state file written by 2.0.5 is
+still read — its modes apply, and it is interpreted as `standard` — because
+losing a user's switches to a schema bump would be the worse failure.
+
+**Nothing about the trade-offs changed.** A tier only moves budgets: it never
+changes which transforms run, and it never lets `elide` drop a result it cannot
+hand back, so an unrecoverable result stays whole at every tier. `--depth
+<standard|deep|extreme>` on `tools/measure-tokens.mjs` prices whichever table the
+panel applies, so the three rows above are one command each rather than three
+hand-written `--budgets` lines.
+
 ## 2.0.5
 
 One fix, in the only place this plugin writes *into* the conversation rather than

@@ -15,6 +15,7 @@ import {
 } from '../lib/memo.js';
 import { rank, renderRecall, selectExcerpts, terms } from '../lib/recall.js';
 import { DEFAULT_CONFIG } from '../lib/defaults.js';
+import { emptyStats, recordAged, sanitizeStats, summarizeStats, toolRows } from '../lib/stats.js';
 
 // ---------------------------------------------------------------------------
 // modes
@@ -71,9 +72,35 @@ test('mode state round-trips through the profile directory', () => {
     assert.equal(readState(dir), undefined, 'nothing persisted yet');
     const written = writeState(dir, { json: false, recall: false });
     assert.equal(written, join(dir, STATE_FILE));
-    assert.deepEqual(readState(dir), { json: false, recall: false });
+    assert.deepEqual(readState(dir), { modes: { json: false, recall: false }, elisionDepth: undefined });
     // The write is atomic, so no temporary file is left behind.
-    assert.equal(readState(dir).nope, undefined);
+    assert.equal(readState(dir).modes.nope, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the elision tier is state of its own, and an unknown one is dropped', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tf-depth-'));
+  try {
+    writeState(dir, { json: false }, 'extreme');
+    assert.deepEqual(readState(dir), { modes: { json: false }, elisionDepth: 'extreme' });
+    // A tier alone is state: the panel can move the depth without a mode switch.
+    writeState(dir, {}, 'deep');
+    assert.deepEqual(readState(dir), { modes: {}, elisionDepth: 'deep' });
+    // An unknown tier is discarded rather than persisted as a policy change.
+    writeState(dir, { json: true }, 'nonsense');
+    assert.deepEqual(readState(dir), { modes: { json: true }, elisionDepth: undefined });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a version 1 state file still yields its modes, on the default tier', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tf-v1-'));
+  try {
+    writeFileSync(join(dir, STATE_FILE), JSON.stringify({ version: 1, modes: { json: false } }));
+    assert.deepEqual(readState(dir), { modes: { json: false }, elisionDepth: undefined });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -271,4 +298,65 @@ test('an empty document never injects anything', () => {
   const selection = selectExcerpts([], 'anything at all', {});
   assert.deepEqual(selection.excerpts, []);
   assert.equal(renderRecall(selection, 'path'), '');
+});
+
+import { applyDepth, depthFor } from '../lib/depths.js';
+
+test('an elision tier merges over the resolved budget table without mutating it', async () => {
+  const { resolveConfig } = await import('../index.js');
+  const resolved = resolveConfig({ toolBudgets: { read: 9999 } });
+  const standard = applyDepth('standard', resolved);
+  assert.equal(standard.depth, 'standard');
+  assert.equal(standard.defaultMaxChars, resolved.defaultMaxChars);
+  assert.deepEqual([...standard.budgets], [...resolved.budgets], 'the default tier is the configured table itself');
+  const extreme = applyDepth('extreme', resolved);
+  assert.equal(extreme.depth, 'extreme');
+  assert.equal(extreme.defaultMaxChars, 500);
+  assert.equal(extreme.budgets.get('read'), 800, 'a tier overrides the tool it names');
+  assert.equal(extreme.budgets.get('edit'), resolved.budgets.get('edit'), 'a tool the tier does not name keeps its configured budget');
+  assert.equal(resolved.budgets.get('read'), 9999, 'the tier does not mutate the config it was applied to');
+});
+
+// ---------------------------------------------------------------------------
+// the elision depth's aging rule
+// ---------------------------------------------------------------------------
+
+test('only the deeper tiers age a result, and each one names its rule', () => {
+  assert.equal(depthFor('standard').aging, undefined, 'the default tier must not rewrite anything after arrival');
+  for (const id of ['deep', 'extreme']) {
+    const aging = depthFor(id).aging;
+    assert.ok(Number.isInteger(aging.keepFull) && aging.keepFull > 0, `${id} must keep a positive number of results whole`);
+    assert.ok(Number.isInteger(aging.lateLimit) && aging.lateLimit > 0, `${id} must name a positive late limit`);
+  }
+  assert.ok(depthFor('extreme').aging.keepFull <= depthFor('deep').aging.keepFull, 'the extreme tier keeps no more results whole than the deep tier');
+  assert.ok(depthFor('extreme').aging.lateLimit < depthFor('deep').aging.lateLimit, 'the extreme tier digests harder');
+  assert.deepEqual(depthFor('deep').aging, { keepFull: 2, lateLimit: 300 }, 'the deep tier ships the constants the corpus measured');
+  assert.deepEqual(depthFor('extreme').aging, { keepFull: 1, lateLimit: 200 }, 'the extreme tier ships the constants the corpus measured');
+});
+
+test('applyDepth carries the aging rule through with the rest of the tier', () => {
+  const resolved = { defaultMaxChars: 4000, budgets: new Map([['read', 9999]]) };
+  assert.equal(applyDepth('standard', resolved).aging, undefined, 'the default tier must not rewrite anything after arrival');
+  const deep = applyDepth('deep', resolved);
+  assert.deepEqual(deep.aging, { keepFull: 2, lateLimit: 300 });
+  assert.equal(deep.defaultMaxChars, 1000, 'the tier still owns its arrival budget');
+  assert.equal(deep.budgets.get('read'), 1500, 'the tier table still wins over the profile');
+  assert.equal(applyDepth('standard', resolved).budgets.get('read'), 9999, 'the default tier keeps the profile table');
+});
+
+test('an aged result is counted as its own kind of saving, never as a call', () => {
+  const stats = emptyStats();
+  recordAged(stats, 'read', 5000, 700);
+  recordAged(stats, 'read', 4000, 600);
+  const summary = summarizeStats(stats);
+  assert.equal(summary.aged, 2);
+  assert.equal(summary.before, 9000);
+  assert.equal(summary.after, 1300);
+  assert.equal(summary.calls, 0, 'aging never fabricates a tool call');
+  assert.equal(summary.rewritten, 0, 'aging is not an arrival rewrite');
+  assert.equal(summary.savedChars, 7700);
+  assert.equal(toolRows(stats).find((row) => row.tool === 'read').savedChars, 7700);
+  const sanitized = sanitizeStats({ aged: 3, before: 10, after: 4, bogus: 1 });
+  assert.equal(sanitized.aged, 3, 'a persisted record keeps the new counter');
+  assert.equal(Object.hasOwn(sanitized, 'bogus'), false);
 });

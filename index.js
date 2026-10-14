@@ -36,17 +36,20 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname, isAbsolute, join } from 'node:path';
-import { compressContent, compressContentToBudget } from './lib/compress.js';
+import { agingRecoveryHint, compressContent, compressContentToBudget } from './lib/compress.js';
 import { CHARS_PER_TOKEN, contentChars, estimateToolsTokens } from './lib/estimate.js';
 import { DEFAULT_BRIDGE, DEFAULT_CONFIG, DEFAULT_MEMO, DEFAULT_RECALL } from './lib/defaults.js';
 import {
   MODE_IDS, effectivePolicy, modeAvailable, readState, resolveModes, sanitizeModePatch,
   stateDirectory, writeState,
 } from './lib/modes.js';
+import {
+  DEFAULT_ELISION_DEPTH, ELISION_DEPTHS, applyDepth, sanitizeDepth,
+} from './lib/depths.js';
 import { appendBlock, extractPoints, parseMemo, summaryBlock, userBlock } from './lib/memo.js';
 import { renderRecall, selectExcerpts } from './lib/recall.js';
 import {
-  emptyStats, readStats, recordCall, recordCatalogue, recordRecall, recordRewrite,
+  emptyStats, readStats, recordAged, recordCall, recordCatalogue, recordRecall, recordRewrite,
   recordSpillFailure, savedChars, statsFilePath, summarizeStats, toolRows, writeStats,
 } from './lib/stats.js';
 
@@ -390,10 +393,19 @@ export function apply(ctx, config) {
   // -------------------------------------------------------------------------
   const stateDir = stateDirectory();
   const persisted = readState(stateDir);
-  let modes = { ...resolveModes(resolved), ...persisted };
+  let modes = { ...resolveModes(resolved), ...(persisted?.modes ?? {}) };
   let policy = effectivePolicy(modes);
+  // The budget table the panel's depth tier implies, held apart from `resolved`
+  // so the row's own config stays the floor a tier is applied on top of.
+  let tuning = applyDepth(persisted?.elisionDepth ?? DEFAULT_ELISION_DEPTH, resolved);
   const modeSummary = () => ({
     modes: MODE_IDS.map((id) => ({ id, on: modes[id] !== false, available: modeAvailable(id, resolved) })),
+    elisionDepth: tuning.depth,
+    depths: ELISION_DEPTHS.map((depth) => ({
+      id: depth.id,
+      promptReductionPercent: depth.promptReductionPercent,
+      defaultMaxChars: depth.defaultMaxChars ?? resolved.defaultMaxChars,
+    })),
     profileDir: stateDir ?? null,
     recallBudget: resolved.recall.maxChars,
   });
@@ -534,8 +546,8 @@ export function apply(ctx, config) {
       const afterLossless = contentChars(lossless.blocks);
 
       const budget = result.isError
-        ? Math.round((resolved.budgets.get(exec.name) ?? resolved.defaultMaxChars) * resolved.errorBudgetFactor)
-        : (resolved.budgets.get(exec.name) ?? resolved.defaultMaxChars);
+        ? Math.round((tuning.budgets.get(exec.name) ?? tuning.defaultMaxChars) * resolved.errorBudgetFactor)
+        : (tuning.budgets.get(exec.name) ?? tuning.defaultMaxChars);
 
       let blocks = lossless.blocks;
       let elided = false;
@@ -620,7 +632,7 @@ export function apply(ctx, config) {
     const sessionId = agent?.id;
     const cwd = agent?.session?.header?.cwd;
     const memoPath = memoFileFor(resolved, cwd);
-    const entry = { memoPath, cwd, turn: 0, assistant: '', injected: new Set(), recorded: false };
+    const entry = { memoPath, cwd, turn: 0, assistant: '', injected: new Set(), recorded: false, results: [], calls: new Map() };
     sessions.set(sessionId, entry);
     // An `agent/created` listener that throws rolls back agent creation, so
     // every failure here degrades to "no restriction" with a warning.
@@ -650,6 +662,117 @@ export function apply(ctx, config) {
   // "no restart" promise holds for the session the user is looking at rather
   // than only for conversations started afterwards.
   for (const live of ctx.get('agents')?.list?.() ?? []) initializeSession(live);
+
+// -------------------------------------------------------------------------
+// 3. agent/pre-step — age old tool results down to a digest
+// -------------------------------------------------------------------------
+/**
+ * The tool name behind one result node, looked up through the call the result
+ * answers. A `tool/result` event names its call, not its tool, and the digest
+ * should tell a reader which tool to run again.
+ * @param entry - the session's tracked state.
+ * @param message - the replacement's predecessor message.
+ * @returns the tool name, or `tool` when the call was never seen.
+ */
+const resultToolName = (entry, message) => {
+  const callId = message?.toolCallId;
+  return (callId !== undefined && entry.calls.get(callId)) || 'tool';
+};
+
+/**
+ * Trade the body of every result that has fallen out of the newest few for a
+ * short digest, addressed to the model only.
+ *
+ * A surface replacement publishes a new `tool/result` node that shadows the
+ * original for the request path while the original stays in the transcript,
+ * which is exactly the property `tools/post-execute` cannot offer: at arrival
+ * time a result may still be the one the model is about to reason from, but a
+ * result from several turns back has already paid its way. `dsh-session`
+ * allows this rewrite only when the replacement is a `tool/result` over
+ * exactly one current `tool/result` node and changes nothing but
+ * `message.content`, so the original event's whole `data` is spread into the
+ * new one.
+ *
+ * One attempt per result: a node that could not save anything is not retried
+ * on every later step.
+ * @param agent - the agent whose session is about to take a step.
+ */
+const ageResults = (agent) => {
+  const aging = tuning.aging;
+  if (aging === undefined) return;
+  const live = agent?.session;
+  const entry = sessions.get(live?.id);
+  if (live === undefined || entry === undefined) return;
+  const pending = entry.results.filter((item) => !item.aged);
+  if (pending.length <= aging.keepFull) return;
+  for (const item of pending.slice(0, pending.length - aging.keepFull)) {
+    // Marked before the attempt: the next step must not try this node again.
+    item.aged = true;
+    try {
+      const original = live.eventAt?.(item.seq);
+      if (original?.type !== 'tool/result') continue;
+      const message = original.data?.message;
+      const blocks = message?.content;
+      if (!Array.isArray(blocks) || blocks.length === 0) continue;
+      const before = contentChars(blocks);
+      if (before <= aging.lateLimit) continue;
+      const name = resultToolName(entry, message);
+      const bounded = compressContentToBudget(blocks, aging.lateLimit, {
+        ...baseOptions(),
+        headRatio: resolved.headRatio,
+        tailRatio: resolved.tailRatio,
+        structureAware: resolved.structureAware,
+        recoveryHint: agingRecoveryHint(name, blocks.filter((block) => block?.type === 'text').map((block) => block.text).join(''), resolved.readSourceRecovery),
+      });
+      if (bounded === undefined || bounded.after >= before) continue;
+      live.append('tool/result', {
+        ...original.data,
+        message: { ...message, content: bounded.blocks },
+      }, {
+        surfaceOp: { op: 'replace', startSeq: item.seq, endSeq: item.seq },
+        sourceEventSeqs: [item.seq],
+      });
+      recordAged(session, name, before, bounded.after);
+      recordAged(cumulative, name, before, bounded.after);
+      scheduleFlush();
+      ctx.logger.debug(`token-frugal: aged ${name} at seq ${item.seq}, ${before} -> ${bounded.after} chars`);
+    } catch (error) {
+      ctx.logger.warn(`token-frugal: could not age seq ${item.seq} (${String(error)})`);
+    }
+  }
+};
+
+/**
+ * Note every result worth aging later, and the calls that name them.
+ *
+ * Only a result that arrived larger than the tier's late limit can ever save
+ * anything, so the rest are never tracked and never inspected again.
+ */
+ctx.on('session/event', (tracked, event) => {
+  const entry = sessions.get(tracked?.id);
+  if (entry === undefined || tuning.aging === undefined) return;
+  if (event?.type === 'tool/call') {
+    if (typeof event.data?.callId === 'string') entry.calls.set(event.data.callId, event.data.name);
+    return;
+  }
+  if (event?.type !== 'tool/result') return;
+  const blocks = event.data?.message?.content;
+  if (!Array.isArray(blocks) || blocks.length === 0) return;
+  if (contentChars(blocks) <= tuning.aging.lateLimit) return;
+  entry.results.push({ seq: event.seq, aged: false });
+});
+
+// The digest is committed before the step that will read it, so the request
+// built from this step already carries the shorter history. A failure here
+// must never abort the turn: the plugin only ever makes a request smaller.
+ctx.on('agent/pre-step', async (payload, next) => {
+  try {
+    ageResults(payload?.agent);
+  } catch (error) {
+    ctx.logger.warn(`token-frugal: aging skipped (${String(error)})`);
+  }
+  return next();
+});
 
   ctx.on('agent/disposed', ({ agent }) => {
     owned.get(agent?.id)?.();
@@ -802,20 +925,31 @@ export function apply(ctx, config) {
           }
           const body = await readJsonBody(request);
           const patch = sanitizeModePatch(body?.modes);
-          if (Object.keys(patch).length === 0) {
-            sendJson(response, 400, { error: 'no valid mode values in "modes"' });
+          const named = body !== null && typeof body === 'object' && Object.hasOwn(body, 'depth');
+          const depth = sanitizeDepth(body?.depth);
+          if (Object.keys(patch).length === 0 && !named) {
+            sendJson(response, 400, { error: 'no valid mode values in "modes" and no "depth"' });
+            return;
+          }
+          if (named && depth === undefined) {
+            sendJson(response, 400, { error: `unknown depth "${String(body?.depth)}"` });
             return;
           }
           const previous = { ...modes };
+          const previousDepth = tuning.depth;
           modes = { ...modes, ...patch };
           policy = effectivePolicy(modes);
           if (Object.hasOwn(patch, 'catalogue')) applyCatalogue(policy.catalogue);
-          const path = writeState(stateDir, modes);
+          if (depth !== undefined) tuning = applyDepth(depth, resolved);
+          const path = writeState(stateDir, modes, tuning.depth);
           ctx.logger.info(
-            `token-frugal: modes changed via panel (${Object.entries(patch).map(([key, on]) => `${key}=${on}`).join(' ')}), `
+            `token-frugal: panel change (${Object.entries(patch).map(([key, on]) => `${key}=${on}`).join(' ') || 'no mode change'}), `
+            + `elisionDepth=${previousDepth}->${tuning.depth}, `
             + `${path === undefined ? 'NOT persisted (no profile directory)' : `persisted to ${path}`}`,
           );
-          sendJson(response, 200, { ...modeSummary(), changed: patch, previous, persistedTo: path ?? null });
+          sendJson(response, 200, {
+            ...modeSummary(), changed: patch, previous, previousDepth, persistedTo: path ?? null,
+          });
         } catch (error) {
           sendJson(response, 400, { error: String(error?.message ?? error) });
         }
@@ -859,10 +993,10 @@ export function apply(ctx, config) {
   });
 
   if (resolved.logStatsEvery > 0) {
-    const budgets = [...resolved.budgets].map(([tool, chars]) => `${tool}=${chars}`).join(' ');
+    const budgets = [...tuning.budgets].map(([tool, chars]) => `${tool}=${chars}`).join(' ');
     const on = MODE_IDS.filter((id) => modes[id] !== false && modeAvailable(id, resolved));
     ctx.logger.info(
-      `token-frugal: ready (defaultMaxChars=${resolved.defaultMaxChars} budgets= ${budgets}) `
+      `token-frugal: ready (elisionDepth=${tuning.depth} defaultMaxChars=${tuning.defaultMaxChars} budgets= ${budgets}) `
       + `modes=[${on.join(',')}] memo=${resolved.memo.enabled ? resolved.memo.path : 'off'} `
       + `recall=${resolved.recall.enabled ? `${resolved.recall.maxChars}chars` : 'off'} bridge=${resolved.bridge.path} `
       + `stats=${statsRoute}`,

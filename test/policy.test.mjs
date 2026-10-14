@@ -176,3 +176,37 @@ test('a partial config overrides only what it names', async () => {
   assert.equal(resolved.defaultMaxChars, DEFAULT_CONFIG.defaultMaxChars);
   assert.deepEqual(resolved.hiddenTools, ['workflow'], 'duplicates collapse');
 });
+
+import { ELISION_DEPTH_IDS, depthFor } from '../lib/depths.js';
+
+test('an elision tier is a whole budget table, and standard is the profile unchanged', () => {
+  const base = resolvePolicy({}).policy;
+  const standard = resolvePolicy({ depth: 'standard' }).policy;
+  assert.equal(standard.defaultMaxChars, base.defaultMaxChars);
+  assert.deepEqual(standard.toolBudgets, base.toolBudgets);
+  const deep = resolvePolicy({ depth: 'deep' }).policy;
+  const extreme = resolvePolicy({ depth: 'extreme' }).policy;
+  assert.deepEqual(ELISION_DEPTH_IDS, ['standard', 'deep', 'extreme']);
+  assert.equal(deep.defaultMaxChars, depthFor('deep').defaultMaxChars);
+  assert.equal(extreme.defaultMaxChars, depthFor('extreme').defaultMaxChars);
+  assert.ok(extreme.defaultMaxChars < deep.defaultMaxChars, 'extreme is tighter than deep');
+  assert.ok(deep.toolBudgets.read < base.toolBudgets.read, 'deep tightens the biggest producer');
+  assert.ok(extreme.toolBudgets.read < deep.toolBudgets.read, 'extreme tightens it further');
+  assert.equal(deep.toolBudgets.edit, base.toolBudgets.edit, 'a tool the tier does not name keeps its number');
+  assert.match(resolvePolicy({ depth: 'deep' }).source, /--depth deep$/, 'the report names the tier that produced it');
+});
+
+test('a tier overrides the tools it names, and the explicit flags still win over it', () => {
+  const patchTuned = resolvePolicy({}).policy;
+  const extreme = resolvePolicy({ depth: 'extreme' }).policy;
+  assert.equal(extreme.toolBudgets.read, depthFor('extreme').budgets.read, 'the tier wins over the patch for a tool it names');
+  assert.equal(extreme.toolBudgets.pwsh, depthFor('extreme').budgets.pwsh);
+  assert.equal(resolvePolicy({ depth: 'extreme', budgets: 'grep:4321' }).policy.toolBudgets.grep, 4321, '--budgets is applied after --depth');
+  assert.equal(resolvePolicy({ depth: 'extreme', defaultMaxChars: 9000 }).policy.defaultMaxChars, 9000, '--default-max-chars is applied after --depth');
+  assert.notEqual(patchTuned.toolBudgets.read, extreme.toolBudgets.read);
+});
+
+test('an unknown elision tier is refused instead of falling back', () => {
+  assert.equal(parseArgs(['node', 'x', '--depth', 'deep']).depth, 'deep');
+  assert.throws(() => resolvePolicy({ depth: 'deeper' }), /unknown --depth/);
+});

@@ -348,8 +348,8 @@ The fields that matter most:
 
 ### Measured budget profiles
 
-Same corpus, same methodology; `--budgets` and `--default-max-chars` reproduce
-each row:
+Same corpus, same methodology as the 149-request run quoted in the v2.0.0 notes;
+`--budgets` and `--default-max-chars` reproduce each row:
 
 | Profile | Prompt-token reduction |
 |---|---|
@@ -365,6 +365,73 @@ dominated by fetched pages, terminal output, and re-read files gain the most.
 The shipped defaults sit just above the loosest profile that still clears 40%
 (`read: 3200`, `pwsh: 1300`), which is why they are tighter than they look.
 
+### The elision depth
+
+The 高等 grade's biggest lever is a single number: the character budget a tool
+result is cut down to. A result is re-sent on every later request in its session,
+so one character removed at the source is worth roughly 250 characters of prompt.
+That is why the third grade also carries a selector, and why the shipped
+behaviour is the shallowest of its three tiers: a budget table is the one policy
+a cautious user should move deliberately.
+
+| Tier | Tool-result characters removed | Billed prompt tokens removed |
+|---|---|---|
+| 标准 `standard` | 47.2% | 21.8% |
+| 深度 `deep` | 63.8% | 29.5% |
+| 极限 `extreme` | 78.8% | 32.1% |
+
+The share is of *billed* tokens: a cache miss priced at ten times a cache read,
+which is the ratio the provider publishes. A share that counts raw tokens
+overstates every tier, because a rewrite that lands in old history invalidates
+the cached prefix from that position on and pays for it again.
+The three rows are one replay of the same corpus — the frozen one the script
+measures by default (1946 requests across the 13 replayed sessions, modes at their
+shipped defaults) — so the tier is the only variable; `--depth` reproduces any
+row:
+
+    node tools/measure-tokens.mjs --depth deep
+
+The deeper tiers override `defaultMaxChars` and the budgets of the tools that
+produce the bulk of the context (`read`, `web_fetch`, `web_search`, `pwsh`,
+`bash`, `grep`, `glob`), by overriding those entries in the configured table
+rather than replacing it — a tool the tier does not name keeps whatever the
+profile gave it, and `--budgets` / `--default-max-chars` still win over a tier.
+A tier only moves budgets: it never changes
+which transforms run, and it never lets `elide` drop something it cannot hand
+back, so an unrecoverable result stays whole at every tier. The choice is
+persisted as `elisionDepth` beside the modes in
+`dsh-token-frugal.state.json`; a state file written by v2.0.5 is read as
+`standard`, and an unknown tier is refused with a 400 instead of silently
+falling back to one the panel did not ask for.
+
+### Aging a result that stopped being new
+
+The deeper tiers keep cutting after arrival. Once a result has fallen out of the
+newest two (`deep`) or the newest one (`extreme`), the model stops being sent the
+result and starts being sent a digest of it — the head, the tail, and the same
+`... [N line(s), M char(s) elided by dsh-token-frugal. Re-run read for the full
+output.] ...` marker an arrival-time elision carries. Fresh results are the ones a
+reasoning model still works from, so the budget goes where it is worth least.
+
+| Tier | Kept whole | Older results | Billed prompt tokens removed |
+|---|---|---|---|
+| 标准 `standard` | every result | untouched | 21.8% |
+| 深度 `deep` | newest 2 | 300-character digest | 29.5% |
+| 极限 `extreme` | newest 1 | 200-character digest | 32.1% |
+
+Nothing is destroyed. The rewrite is a *model-only* surface replacement
+(`surfaceOp`), so the durable log, the transcript, and the statistics keep the
+original; the replacement shadows it only in the request the model reads. It is
+committed on `agent/pre-step`, before the request that will read it, and each
+result is aged at most once.
+
+The constants are measured, and the re-prefill cost is why they are so small.
+Every digest lands in old history, so it invalidates the cached prefix from that
+point on; the digest only pays for itself when it lands near the tail. Without
+aging the same tiers bill 21.8%, 27.15% and 31.55% — so `deep` is where the rule
+earns its place, and `keepFull` at three or more is a net loss. `--aging-keep` and
+`--aging-limit` re-run the search; `--no-aging` prices a tier as it was before
+this feature.
 ### Tool-catalogue visibility
 
 The `agent/created` half is inert until `hiddenTools` names something, because
@@ -405,6 +472,9 @@ prices both with the same fixed-density heuristic the Harness uses for its
 | `--compare-placement` | Also model delivering the same reduction by rewriting history once, late. |
 | `--include-live` | Include the session that is still being written (excluded by default). |
 | `--budgets`, `--default-max-chars`, `--no-elide` | Re-price an alternative policy without editing anything. |
+| `--depth <tier>` | Price the panel's `standard` / `deep` / `extreme` budget table; `--budgets` and `--default-max-chars` still win over it. |
+| `--aging-keep <n>`, `--aging-limit <chars>` | Re-run the aging search: how many results stay whole, and what an older one is cut to. |
+| `--no-aging` | Price a tier as it was before aging existed. |
 | `--only <tool>`, `--patch`, `--no-patch`, `--config`, `--quiet` | Narrowing and policy selection. |
 
 **Bounded by construction.** The script prints at most `--max-lines` lines, each

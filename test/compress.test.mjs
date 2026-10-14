@@ -134,3 +134,13 @@ test('terminal-only noise still yields a strict reduction, not a copy', () => {
   assert.ok(out.length < noisy.length);
   assert.ok(!out.includes('\u001b'));
 });
+
+test('a budget too small to carry the marker refuses to elide', () => {
+  const body = Array.from({ length: 40 }, (_, i) => `line ${i} ${'z'.repeat(60)}`);
+  const text = body.join('\n');
+  assert.equal(elideToBudget(text, { maxChars: 30, recoveryHint: ' Re-read x.' }), undefined, 'a cut-off pointer reads as damage, so it is not emitted');
+  const out = elideToBudget(text, { maxChars: 120, recoveryHint: ' Re-read x.' });
+  assert.ok(out !== undefined, 'a budget that can carry the marker still elides');
+  assert.ok(out.length <= 120, `the bound stays absolute, got ${out.length}`);
+  assert.match(out, /elided by dsh-token-frugal\. Re-read x\./);
+});
